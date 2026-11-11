@@ -18,6 +18,7 @@ import tempfile
 import time
 import types
 import unittest
+from datetime import UTC, datetime
 from enum import IntFlag
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,7 +84,7 @@ def _framework_modules(data_dir: Path) -> dict[str, types.ModuleType]:
 class FakeEvent:
     def __init__(
         self,
-        text="群管 信息",
+        text="信息",
         *,
         platform="qq_official",
         group="group-1",
@@ -180,7 +181,7 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         # Keep exception classes and pure plugin modules identical to those used
         # elsewhere in this test process while importing main as a real package.
         modules[PACKAGE_NAME + ".qq_admin"] = importlib.import_module("qq_admin")
-        for name in ("api", "integration", "manager", "panels", "security", "store"):
+        for name in ("api", "commands", "integration", "manager", "panels", "security", "store"):
             modules[f"{PACKAGE_NAME}.qq_admin.{name}"] = importlib.import_module(f"qq_admin.{name}")
         self.module_patch = patch.dict(sys.modules, modules)
         self.module_patch.start()
@@ -227,8 +228,10 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_alias_and_native_callback_are_registered_at_high_priority(self):
         command = self.handler("command")
         record = next(item for item in command._contract_filters if item[0] == "command")
-        self.assertEqual(record[1], ("群管",))
+        self.assertEqual(record[1], ("面板",))
+        self.assertTrue({"禁言", "解禁", "移出", "帮助", "确认", "群管"} <= record[2]["alias"])
         self.assertIn("qqadmin", record[2]["alias"])
+        self.assertNotIn("help", record[2]["alias"])
         self.assertEqual(record[2]["priority"], 100)
         callback = self.handler("button_action")
         record = next(item for item in callback._contract_filters if item[0] == "button_action")
@@ -244,6 +247,91 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args[0].group_id, "group-1")
             self.assertEqual(args[1], "信息")
         self.assertEqual(self.sender.await_count, 2)
+
+    async def test_direct_commands_and_old_prefixes_reach_the_same_action(self):
+        for text in (
+            "/禁言 target 10m",
+            "禁言 target 10m",
+            "/群管 禁言 target 10m",
+            "/qqadmin 禁言 target 10m",
+        ):
+            with self.subTest(text=text):
+                self.plugin._manager.handle.reset_mock()
+                await self.handler("command")(FakeEvent(text))
+                self.plugin._manager.handle.assert_awaited_once()
+                self.assertEqual(self.plugin._manager.handle.await_args.args[1], "禁言 target 10m")
+
+    async def test_native_mention_maps_to_member_openid_and_excludes_wake_mention(self):
+        for platform in ("qq_official", "qq_official_webhook"):
+            event = FakeEvent("禁言 <@!qq-user-id> 30分钟", platform=platform)
+            event.message_obj.raw_message.content = "<@!bot-1> /禁言 <@!qq-user-id> 30分钟"
+            event.message_obj.raw_message.mentions = [
+                {"id": "bot-1", "member_openid": "bot-member", "is_you": True, "bot": True},
+                {"id": "qq-user-id", "member_openid": "target-member", "bot": False},
+            ]
+            await self.handler("command")(event)
+            self.assertEqual(
+                self.plugin._manager.handle.await_args.args[1], "禁言 target-member 30分钟"
+            )
+
+    async def test_default_mute_and_multiple_targets_do_not_require_openid_typing(self):
+        event = FakeEvent('/禁言 <qqbot-at-user id="first" /> <qqbot-at-user id="second" />')
+        event.message_obj.raw_message.mentions = [
+            {"id": "first", "member_openid": "member-first"},
+            {"id": "second", "member_openid": "member-second"},
+        ]
+        await self.handler("command")(event)
+        self.assertEqual(
+            self.plugin._manager.handle.await_args.args[1], "禁言 member-first,member-second"
+        )
+
+    async def test_unresolved_typed_nickname_is_not_submitted_as_a_target(self):
+        event = FakeEvent("/禁言 @张三 10m")
+        await self.handler("command")(event)
+        self.plugin._manager.handle.assert_not_awaited()
+        self.assertTrue(event.stopped)
+        self.sender.assert_awaited_once()
+
+    async def test_direct_mention_command_executes_only_selected_members_after_button_confirmation(
+        self,
+    ):
+        manager = self.plugin._manager
+        manager.handle = type(manager).handle.__get__(manager)
+        transport = SimpleNamespace(request=AsyncMock(return_value={}))
+        self.plugin._transport = AsyncMock(return_value=transport)
+        event = FakeEvent('/禁言 <qqbot-at-user id="alias-a" /> <@alias-b>')
+        event.message_obj.raw_message.mentions = [
+            {"id": "bot-1", "member_openid": "robot-member", "is_you": True},
+            {"id": "alias-a", "member_openid": "member-a"},
+            {"id": "alias-b", "member_openid": "member-b"},
+        ]
+        with patch.object(self.plugin, "_deliver", wraps=self.plugin._deliver) as deliver:
+            await self.handler("command")(event)
+            panel = deliver.await_args.args[1]
+            self.assertEqual(panel.title, "请确认管理操作")
+            self.assertIn("600 秒", panel.body)
+            self.assertNotIn("robot-member", panel.body)
+            transport.request.assert_not_awaited()
+            confirmation = panel.buttons[0].command
+            click = FakeEvent(
+                interaction=SimpleNamespace(
+                    action_id="qqadmin", data=button_data(command=confirmation)
+                )
+            )
+            await self.handler("button_action")(click)
+            transport.request.assert_awaited_once()
+            request = transport.request.await_args
+            self.assertEqual(request.args, ("POST", "/v2/groups/group-1/restrict_chat_setting"))
+            members = request.kwargs["json"]["members"]
+            self.assertEqual(
+                [member["member_openid"] for member in members], ["member-a", "member-b"]
+            )
+            for member in members:
+                self.assertEqual(member["op"], "add")
+                expiry = datetime.fromisoformat(member["mute_expire_at"])
+                self.assertTrue(595 < (expiry - datetime.now(UTC)).total_seconds() <= 600)
+            await self.handler("button_action")(click)
+            transport.request.assert_awaited_once()
 
     async def test_command_and_callback_ignore_non_qq_groups_and_guild_channels(self):
         for kind in ("command", "button_action"):
@@ -299,7 +387,8 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.args[1]["msg_type"], 2)
         self.assertEqual(second.args[1]["msg_type"], 0)
         self.assertNotIn("keyboard", second.args[1])
-        self.assertIn("/群管", second.args[1]["content"])
+        self.assertIn("/面板", second.args[1]["content"])
+        self.assertNotIn("/群管", second.args[1]["content"])
         self.plugin._manager.handle.assert_awaited_once()
 
     async def test_uncertain_network_failure_never_resends_or_reexecutes(self):

@@ -132,6 +132,59 @@ class EventContextTests(unittest.TestCase):
         ]
         self.assertEqual(extract_mention_ids(event), ["member-2", "member-3"])
 
+    def test_mentions_prefer_group_openid_and_exclude_all_bot_aliases(self):
+        event = make_event()
+        raw = event.message_obj.raw_message
+        raw.content = "<@user-2> <@member-2> <@bot-user> <@bot-member> <@other-bot>"
+        raw.mentions = [
+            {"id": "user-2", "member_openid": "member-2", "user_openid": "private-2"},
+            {"id": "bot-user", "member_openid": "bot-member", "is_you": True},
+            {"id": "other-bot", "bot": True},
+        ]
+        self.assertEqual(extract_mention_ids(event), ["member-2"])
+
+    def test_richer_raw_data_resolves_incomplete_sdk_mentions_and_components(self):
+        event = make_event()
+        raw = event.message_obj.raw_message
+        raw.mentions = [SimpleNamespace(id="user-2")]
+        raw.raw_data = {
+            "mentions": [
+                {"id": "user-2", "member_openid": "member-2"},
+                {"id": "bot-user", "member_openid": "bot-member", "is_you": True},
+            ],
+            "content": "<@!user-2> <@!bot-user>",
+        }
+        At = type("At", (), {})
+        target, bot = At(), At()
+        target.qq, bot.qq = "user-2", "bot-user"
+        event.get_messages = lambda: [target, bot]
+        self.assertEqual(extract_mention_ids(event), ["member-2"])
+
+    def test_private_chat_and_union_identifiers_are_never_member_fallbacks(self):
+        event = make_event()
+        event.message_obj.raw_message.mentions = [
+            {"user_openid": "private-2", "union_user_account": "account-2"},
+            {"id": "documented-user-openid", "username": "nickname"},
+        ]
+        self.assertEqual(extract_mention_ids(event), ["documented-user-openid"])
+
+    def test_conflicting_mention_identities_cannot_choose_a_target(self):
+        event = make_event()
+        event.message_obj.raw_message.mentions = [
+            {"id": "user-2", "member_openid": "member-2"},
+            {"id": "user-2", "member_openid": "member-3"},
+        ]
+        with self.assertRaisesRegex(ValueError, "身份不一致"):
+            extract_mention_ids(event)
+
+    def test_mentions_from_quoted_message_are_not_targets(self):
+        event = make_event()
+        event.message_obj.raw_message.raw_data = {
+            "msg_elements": [{"ref": {"content": "<@quoted-user>"}}],
+            "message_reference": {"mentions": [{"id": "quoted-user"}]},
+        }
+        self.assertEqual(extract_mention_ids(event), [])
+
     def test_callback_passes_json_and_expiry_to_native_encoder(self):
         module = types.ModuleType("astrbot.core.platform.button_interaction")
         observed = []

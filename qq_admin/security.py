@@ -44,15 +44,15 @@ class AccessControl:
     @staticmethod
     def verify_button(ctx: Any, data: Any) -> str:
         if not isinstance(data, dict):
-            raise PermissionDenied("按钮数据无效，请重新发送 /群管。")
+            raise PermissionDenied("按钮数据无效，请重新发送 /面板。")
         expected = {
             "platform_id": ctx.platform_id,
             "group_id": ctx.group_id,
             "owner_id": ctx.user_id,
         }
         if any(data.get(key) != value for key, value in expected.items()):
-            raise PermissionDenied("该面板属于其他操作者或群，请发送 /群管 创建自己的面板。")
+            raise PermissionDenied("该面板属于其他操作者或群，请发送 /面板 创建自己的面板。")
         command = data.get("command")
         if not isinstance(command, str) or not command or len(command) > 16000:
-            raise PermissionDenied("按钮指令无效，请重新发送 /群管。")
+            raise PermissionDenied("按钮指令无效，请重新发送 /面板。")
         return command

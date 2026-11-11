@@ -8,10 +8,10 @@
 
 | 入口 | 插件行为 | 依赖 |
 |---|---|---|
-| AstrBot 已分发的 QQ 群消息 | 解析 `/群管` 命令；可在内存记录最近两分钟可见消息 ID | 原始事件存在 `group_openid`、消息作者 `member_openid`，且与 AstrBot 归一化身份一致 |
+| AstrBot 已分发的 QQ 群消息 | 解析 `/禁言`、`/解禁`、`/面板` 等短命令；可在内存记录最近两分钟可见消息 ID | 原始事件存在 `group_openid`、消息作者 `member_openid`，且与 AstrBot 归一化身份一致 |
 | 原生按钮 `INTERACTION_CREATE` | 由 AstrBot 原生按钮分发进入 `qqadmin` 处理器，共用命令权限和确认流程 | QQ 平台订阅互动事件；AstrBot 当前适配器原生按钮支持；账号实际按钮权限 |
 
-通常 QQ 群命令来源是 `GROUP_AT_MESSAGE_CREATE`，用户需 @机器人。即使腾讯已给机器人全量消息资格，插件也只处理 AstrBot 实际收到并转发的消息，不假定所有群消息一定到达。消息可见范围可通过 `/群管 状态` 查看平台返回的 `recv_msg_setting`，具体仍以实际投递为准。
+通常 QQ 群命令来源是 `GROUP_AT_MESSAGE_CREATE`，用户需 @机器人。此时可发送 `@机器人 /禁言 @成员 10m`：@机器人 用于让命令到达机器人，@成员 指定被管理的人；插件会排除机器人自身的提及，不把它作为管理目标。必须通过 QQ 选择成员产生真实提及，不能靠手打 `@昵称` 推断身份。即使腾讯已给机器人全量消息资格，插件也只处理 AstrBot 实际收到并转发的消息，不假定所有群消息一定到达。消息可见范围可通过 `/状态` 查看平台返回的 `recv_msg_setting`，具体仍以实际投递为准。
 
 ## 群身份校验
 
@@ -37,9 +37,9 @@ QQ 原生互动事件使用 `INTERACTION (1 << 26)`。插件通过 AstrBot 原�
 
 互动 ACK 的 `interaction_id` 是事件内层 `d.id`，而发送后续群消息的 `event_id` 是事件最外层 `id`。botpy 在 `Interaction.event_id` 保存外层 ID；两者不能混用。普通消息回复使用 `d.id` 作为 `msg_id`，`msg_id` 与 `event_id` 二选一。
 
-被动回复限 5 分钟，单条消息最多回复 5 次；发送层为相同回复凭据分配不同 `msg_seq`。如果事件已过期，需要重新发送 `/群管`；不能把过期回调改成未经确认的主动推送。
+被动回复限 5 分钟，单条消息最多回复 5 次；发送层为相同回复凭据分配不同 `msg_seq`。如果事件已过期，需要重新发送 `/面板`；不能把过期回调改成未经确认的主动推送。
 
-面板使用 `permission.type=0` 限定原操作者，但消息正文仍公开显示在群里。其他人应发送 `/群管` 创建自己的面板。所有写操作还使用绑定平台/群/用户的 SQLite 一次性令牌，服务端复核管理权限后原子消费，不能靠重放旧按钮再次执行。
+面板使用 `permission.type=0` 限定原操作者，但消息正文仍公开显示在群里。其他人应发送 `/面板` 创建自己的面板。所有写操作还使用绑定平台/群/用户的 SQLite 一次性令牌，服务端复核管理权限后原子消费，不能靠重放旧按钮再次执行。
 
 ## 官方管理事件与本插件状态
 
@@ -53,11 +53,11 @@ QQ 原生互动事件使用 `INTERACTION (1 << 26)`。插件通过 AstrBot 原�
 | `GROUP_MSG_REJECT` | `GROUP_AND_C2C_EVENT (1 << 25)` | `timestamp, group_openid, op_member_openid` | 不注册独立通知开关监听 |
 | `GROUP_MEMBER_ADD` | `GROUP_MEMBER_EVENT (1 << 24)` | `timestamp, group_openid, member_openid` | 当前上游链路未完整分发，不提供自动欢迎 |
 | `GROUP_MEMBER_REMOVE` | `GROUP_MEMBER_EVENT (1 << 24)` | `timestamp, group_openid, member_openid, user_openid?` | 当前上游链路未完整分发，不提供自动退群通知 |
-| `GROUP_JOIN_REQUEST` | `GROUP_MEMBER_EVENT (1 << 24)` | `group_openid, join_request_id, member_openid, verify_info, risk_tips, auto_approved?` | 当前上游链路未完整分发；通过 `/群管 入群` 按需拉取 |
+| `GROUP_JOIN_REQUEST` | `GROUP_MEMBER_EVENT (1 << 24)` | `group_openid, join_request_id, member_openid, verify_info, risk_tips, auto_approved?` | 当前上游链路未完整分发；通过 `/入群` 按需拉取 |
 
 当前兼容基线中的 `qq-botpy==1.2.1` 及 AstrBot 分发链没有把新增成员/申请事件完整映射成插件可直接接收的 AstrMessageEvent。仅在平台勾选 `1 << 24` 并不会自动增加 SDK 对象解析和 AstrBot 分发。因此本插件不声称已经实现全部 7 类事件的实时处理，也不修改 AstrBot 核心、替换 SDK 全局对象或追加未验证 webhook。
 
-这不影响 17 个 HTTP 群管理接口的命令调用。管理员仍可主动查询成员、禁言和黑名单，使用 `/群管 入群` 查看待处理申请并点击审批；自动审批策略由腾讯服务端运行，也不依赖本插件收到每一条入群事件。
+这不影响 17 个 HTTP 群管理接口的命令调用。管理员仍可主动查询成员、禁言和黑名单，使用 `/入群` 查看待处理申请并点击审批；自动审批策略由腾讯服务端运行，也不依赖本插件收到每一条入群事件。
 
 ## 为何不直接推送成员与申请通知
 

@@ -24,6 +24,8 @@ from .api import QQAPIError
 
 API_BASE = "https://api.bot.qq.com"
 QQ_PLATFORMS = frozenset({"qq_official", "qq_official_webhook"})
+MENTION_MARKUP = re.compile(r"""<qqbot-at-user\s+id=["']([^"']+)["']\s*/?>|<@!?([^>\s]+)>""")
+MEMBER_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
 @dataclass(frozen=True)
@@ -303,27 +305,91 @@ def reply_age_seconds(event: Any) -> float:
     return 0.0
 
 
-def extract_mention_ids(event: Any) -> list[str]:
-    """Read QQ user mentions from parsed components and the raw QQ markup."""
-    mentions: list[str] = []
-    self_id = str(event.get_self_id() or "")
-    for component in event.get_messages():
-        # Avoid importing AstrBot just to inspect components in pure unit tests.
-        if type(component).__name__ == "At":
-            user_id = str(_field(component, "qq", "") or "")
-            if user_id and user_id not in {self_id, "all"} and user_id not in mentions:
-                mentions.append(user_id)
+@dataclass(frozen=True)
+class MentionContext:
+    """Current-message mentions resolved to the group member identity.
+
+    QQ's User.id is itself an OpenID, but member_openid is authoritative when
+    both fields are supplied. Never substitute the private-chat user_openid or
+    a nickname. Conflicting metadata must not choose an arbitrary member.
+    """
+
+    aliases: Mapping[str, str]
+    excluded: frozenset[str]
+    ambiguous: frozenset[str]
+    ids: tuple[str, ...] = ()
+
+    def resolve(self, value: str) -> str:
+        if value in self.excluded:
+            return ""
+        if value in self.ambiguous:
+            raise ValueError("QQ 返回的 @成员身份不一致，请重新选择成员发送。")
+        resolved = self.aliases.get(value, value)
+        if resolved in self.excluded:
+            return ""
+        if not MEMBER_ID.fullmatch(resolved):
+            raise ValueError("无法识别 @成员，请在 QQ 中重新选择成员发送。")
+        return resolved
+
+
+def mention_context(event: Any) -> MentionContext:
+    """Read only top-level QQ mentions, excluding quoted/forwarded messages."""
     raw = _field(event.message_obj, "raw_message")
-    for mention in _field(raw, "mentions", None) or []:
-        if _field(mention, "is_you", False) or _field(mention, "bot", False):
+    raw_data = _field(raw, "raw_data")
+    records = list(_field(raw, "mentions", None) or [])
+    records.extend(_field(raw_data, "mentions", None) or [])
+    excluded = {str(event.get_self_id() or ""), "all", "everyone", ""}
+    aliases: dict[str, str] = {}
+    ambiguous: set[str] = set()
+
+    def bind(alias: str, member: str) -> None:
+        previous = aliases.get(alias)
+        if previous is not None and previous != member:
+            ambiguous.add(alias)
+        else:
+            aliases[alias] = member
+
+    # Build every alias and bot exclusion before interpreting any markup or
+    # component; the SDK's incomplete User objects may precede richer raw_data.
+    for record in records:
+        user_id = str(_field(record, "id", "") or "")
+        member_id = str(_field(record, "member_openid", "") or "")
+        if _field(record, "is_you", False) or _field(record, "bot", False):
+            excluded.update((user_id, member_id))
             continue
-        user_id = str(_field(mention, "member_openid") or _field(mention, "id") or "")
-        if user_id and user_id not in {self_id, "all"} and user_id not in mentions:
-            mentions.append(user_id)
-    content = str(_field(raw, "content", "") or "")
-    raw_ids = re.findall(r'<qqbot-at-user\s+id=["\']([^"\']+)["\']\s*/?>', content)
-    raw_ids.extend(re.findall(r"<@!?([^>\s]+)>", content))
-    for user_id in raw_ids:
-        if user_id not in {self_id, "all"} and user_id not in mentions:
-            mentions.append(user_id)
-    return mentions
+        if member_id:
+            bind(member_id, member_id)
+            if user_id:
+                bind(user_id, member_id)
+    for record in records:
+        user_id = str(_field(record, "id", "") or "")
+        if user_id and user_id not in aliases:
+            aliases[user_id] = user_id
+    excluded.update(aliases[value] for value in tuple(excluded) if value in aliases)
+    context = MentionContext(aliases, frozenset(excluded), frozenset(ambiguous))
+    mentions: list[str] = []
+
+    def collect(value: Any) -> None:
+        value = str(value or "")
+        if not value:
+            return
+        member_id = context.resolve(value)
+        if member_id and member_id not in mentions:
+            mentions.append(member_id)
+
+    for component in event.get_messages():
+        # Keep this module independent of AstrBot imports for adapter wrappers.
+        if type(component).__name__ == "At":
+            collect(_field(component, "qq", ""))
+    for record in records:
+        collect(_field(record, "id") or _field(record, "member_openid"))
+    for source in (raw, raw_data):
+        content = str(_field(source, "content", "") or "")
+        for match in MENTION_MARKUP.finditer(content):
+            collect(match[1] or match[2])
+    return MentionContext(aliases, frozenset(excluded), frozenset(ambiguous), tuple(mentions))
+
+
+def extract_mention_ids(event: Any) -> list[str]:
+    """Return deduplicated group member OpenIDs from actual QQ mentions."""
+    return list(mention_context(event).ids)

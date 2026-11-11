@@ -1,7 +1,6 @@
 """AstrBot QQ 官方群管理插件入口。"""
 
 import asyncio
-import re
 import time
 from functools import partial
 from typing import Any
@@ -11,15 +10,15 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .qq_admin.api import QQAPIError, QQGroupAPI
+from .qq_admin.commands import DIRECT_COMMANDS, normalize_command
 from .qq_admin.integration import (
     BotpyTransport,
     encode_callback,
     extract_event_context,
-    extract_mention_ids,
     reply_age_seconds,
     send_payload,
 )
-from .qq_admin.manager import AdminManager, split_head
+from .qq_admin.manager import AdminManager
 from .qq_admin.panels import Panel, build_payload
 from .qq_admin.security import AccessControl
 from .qq_admin.store import LocalStore
@@ -44,7 +43,7 @@ def _plain_panel(panel: Panel) -> str:
     text = f"{panel.title}\n\n{panel.body}"
     if panel.buttons:
         text += "\n\n可用命令：\n" + "\n".join(
-            f"{button.label}：/群管 {button.command}" for button in panel.buttons
+            f"{button.label}：/{button.command}" for button in panel.buttons
         )
     # QQ's XML-like mention tags are executable even in plain messages.
     return text.replace("<", "＜").replace(">", "＞")
@@ -54,7 +53,7 @@ def _plain_panel(panel: Panel) -> str:
     "astrbot_plugin_qqofficial_admin",
     "QQ Official Admin Contributors",
     "QQ 官方群管理、原生按钮与入群审批",
-    "1.0.0",
+    "1.1.0",
 )
 class QQOfficialAdmin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -118,27 +117,22 @@ class QQOfficialAdmin(Star):
                 self._transports[platform_id] = transport
             return transport
 
-    @filter.command("群管", alias={"qqadmin"}, priority=100)
+    @filter.command(
+        "面板", alias=(set(DIRECT_COMMANDS) - {"面板", "help"}) | {"群管", "qqadmin"}, priority=100
+    )
     async def admin_command(self, event: AstrMessageEvent):
-        """QQ群管理面板；发送 /群管 帮助 查看命令。"""
+        """发送 /禁言 @成员 10m 管理成员，/面板 打开面板，/帮助 查看命令。"""
         if self._closing or not self.config.get("enabled", True):
             return
         ctx = extract_event_context(event)
         if ctx is None:
             return
         event.stop_event()
-        text = event.get_message_str().strip()
-        match = re.match(r"^/?(?:群管|qqadmin)(?:\s+|$)(.*)", text, re.S)
-        command = match.group(1).strip() if match else ""
-        # Some adapters expose mentions only in raw_message. Permit an actual
-        # @member as a target without confusing the robot's own wake mention.
-        head, args = split_head(command)
-        mentions = extract_mention_ids(event)
-        if mentions:
-            if head in {"成员详情", "解禁", "移出", "拉黑", "取消拉黑"} and not args:
-                command = f"{head} {','.join(mentions)}"
-            elif head in {"禁言", "更新禁言"} and len(args.split()) == 1:
-                command = f"{head} {','.join(mentions)} {args}"
+        try:
+            command = normalize_command(event)
+        except ValueError as exc:
+            await self._deliver(event, Panel("未执行操作", str(exc)))
+            return
         await self._dispatch(event, command)
 
     @filter.button_action("qqadmin", priority=100)

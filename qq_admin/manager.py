@@ -38,6 +38,7 @@ WRITE_COMMANDS = {
     "全体通知",
 }
 HOME = ButtonSpec("返回面板", "面板")
+DEFAULT_MUTE_SECONDS = 600
 
 
 def split_head(text: str) -> tuple[str, str]:
@@ -52,7 +53,7 @@ def parse_ids(text: str, maximum: int = 20) -> list[str]:
     if not ids or len(ids) > maximum:
         raise ValueError(f"请提供 1–{maximum} 个成员 OpenID，用英文逗号分隔。")
     if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) for value in ids):
-        raise ValueError("成员 OpenID 格式无效。请使用 /群管 成员 查询，不能使用 QQ 号或昵称。")
+        raise ValueError("请直接 @成员，或使用 /成员 查询后填写成员 OpenID，不能填写 QQ 号或昵称。")
     if len(set(ids)) != len(ids):
         raise ValueError("同一次操作不能包含重复的成员 OpenID。")
     return ids
@@ -196,8 +197,8 @@ class AdminManager:
                 summary + "\n\n仅本次操作者可确认，"
                 f"{max(0, int(pending.expires_at - time.time()))} 秒内有效。\n"
                 "确认时会再次验证权限，重复点击不会重复执行。\n\n"
-                f"文本确认：/群管 确认 {pending.token}\n"
-                f"取消：/群管 取消 {pending.token}",
+                f"文本确认：/确认 {pending.token}\n"
+                f"取消：/取消 {pending.token}",
                 [
                     ButtonSpec("确认执行", f"确认 {pending.token}", danger=True),
                     ButtonSpec("取消操作", f"取消 {pending.token}"),
@@ -212,7 +213,7 @@ class AdminManager:
             try:
                 index = int(index)
             except ValueError as exc:
-                raise ValueError("请使用结果分页按钮，或 /群管 结果 令牌 段号。") from exc
+                raise ValueError("请使用结果分页按钮，或 /结果 令牌 段号。") from exc
             return self.pager.page(ctx, token, index)
         if command == "信息":
             return self.pager.show(ctx, "群信息", await api.get_group_info(group), [HOME])
@@ -297,7 +298,7 @@ class AdminManager:
             return self.pager.show(
                 ctx, "最近两分钟可见的消息", {"messages": rows}, buttons + [HOME]
             )
-        raise ValueError("未识别的子命令。发送 /群管 帮助 查看可用命令。")
+        raise ValueError("未识别的管理命令。发送 /帮助 查看可用命令。")
 
     def _parse_write(self, ctx: Any, command: str, args: str) -> tuple[str, dict, str]:
         scope = f"群 OpenID：{ctx.group_id}"
@@ -322,9 +323,18 @@ class AdminManager:
             )
         if command in {"禁言", "更新禁言"}:
             parts = args.rsplit(maxsplit=1)
-            if len(parts) != 2:
-                raise ValueError(f"用法：/群管 {command} 成员OpenID[,成员OpenID] 10m")
-            ids, seconds = parse_ids(parts[0], 20), duration_seconds(parts[1])
+            if not parts or (
+                len(parts) == 1
+                and (
+                    re.fullmatch(r"[0-9]+(?:s|m|h|d|秒|分钟|小时|天)", parts[0], re.I)
+                    or (parts[0].isdigit() and len(parts[0]) != 32)
+                )
+            ):
+                raise ValueError(
+                    f"用法：/{command} @成员 [时长]，例如 /{command} @成员 10m；不填时长默认 10 分钟。"
+                )
+            ids = parse_ids(parts[0], 20)
+            seconds = duration_seconds(parts[1]) if len(parts) == 2 else DEFAULT_MUTE_SECONDS
             return (
                 command,
                 {"members": ids, "seconds": seconds},
@@ -338,7 +348,7 @@ class AdminManager:
             request, reason = split_head(rest)
             member = parse_ids(member, 1)[0]
             if not request or not re.fullmatch(r"[A-Za-z0-9_:.-]{1,512}", request):
-                raise ValueError(f"用法：/群管 {command} 成员OpenID 入群申请ID [拒绝理由]")
+                raise ValueError(f"用法：/{command} 成员OpenID 入群申请ID [拒绝理由]")
             blacklist = False
             if command == "同意" and reason:
                 raise ValueError("同意申请不接受拒绝理由或黑名单参数。")
@@ -379,7 +389,7 @@ class AdminManager:
             strategy_id, rest = split_head(args)
             op, numbers = split_head(rest)
             if op not in {"add", "del"}:
-                raise ValueError("用法：/群管 策略白名单 策略ID add|del QQ号[,QQ号]")
+                raise ValueError("用法：/策略白名单 策略ID add|del QQ号[,QQ号]")
             users = parse_ids(numbers, 10000)
             if any(not value.isascii() or not value.isdigit() for value in users):
                 raise ValueError("策略白名单使用 QQ 号码数字字符串，不使用成员 OpenID。")
@@ -396,7 +406,7 @@ class AdminManager:
                 or len(message_id) > 1024
                 or any(char.isspace() for char in message_id)
             ):
-                raise ValueError("用法：/群管 撤回 消息ID。ID 来自最近消息或官方消息事件 d.id。")
+                raise ValueError("用法：/撤回 消息ID。ID 来自最近消息或官方消息事件 d.id。")
             return (
                 command,
                 {"message_id": message_id},
@@ -409,7 +419,7 @@ class AdminManager:
             if not args.strip() or len(args) > 1500:
                 raise ValueError("通知内容须为 1–1500 字符。")
             if re.search(r"<\s*/?\s*qqbot[-:]|<@|@everyone", args, re.I):
-                raise ValueError("通知请使用普通文本；@全体请使用 /群管 全体通知。")
+                raise ValueError("通知请使用普通文本；@全体请使用 /全体通知。")
             params = {"text": args, "everyone": command == "全体通知"}
             summary = f"{scope}\n{command}内容：\n{args}"
             if params["everyone"]:
@@ -420,7 +430,7 @@ class AdminManager:
     @staticmethod
     def _strategy_id(value: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
-            raise ValueError("请提供正确的策略 ID，使用 /群管 策略列表 查询。")
+            raise ValueError("请提供正确的策略 ID，使用 /策略列表 查询。")
         return value
 
     @staticmethod

@@ -8,7 +8,7 @@
     "description": "允许使用的群 OpenID",
     "type": "list",
     "default": [],
-    "hint": "留空允许所有机器人所在群。填写 group_openid，不是 QQ 群号；使用 /群管 身份 查看。"
+    "hint": "留空允许所有机器人所在群。填写 group_openid，不是 QQ 群号；使用 /身份 查看。"
   },
   "allow_group_admins": {
     "description": "允许经官方接口验证的群主和管理员使用群管",
@@ -20,13 +20,13 @@
     "description": "额外授权的群管理员",
     "type": "list",
     "default": [],
-    "hint": "每项格式：平台ID|群OpenID|成员OpenID。使用 /群管 身份 获取准确值。仅授予该平台该群的操作权限；不能管理机器人全局审批策略。AstrBot 管理员自动拥有管理权限。"
+    "hint": "每项格式：平台ID|群OpenID|成员OpenID。使用 /身份 获取准确值。仅授予该平台该群的操作权限；不能管理机器人全局审批策略。AstrBot 管理员自动拥有管理权限。"
   },
   "confirm_timeout": {
     "description": "操作确认有效期（秒）",
     "type": "int",
     "default": 120,
-    "hint": "允许 30–300 秒。写入操作必须通过按钮或 /群管 确认 令牌 再次确认；重启后确认状态保留。"
+    "hint": "允许 30–300 秒。写入操作必须通过按钮或 /确认 令牌 再次确认；重启后确认状态保留。"
   },
   "use_markdown": {
     "description": "使用原生 Markdown 和按钮面板",

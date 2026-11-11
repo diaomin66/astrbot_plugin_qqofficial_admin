@@ -96,7 +96,7 @@ def build_payload(
         action: dict[str, Any] = {
             "type": 1 if spec.kind == "callback" else 2,
             "permission": {"type": 0, "specify_user_ids": [ctx.user_id]},
-            "unsupport_tips": "请升级 QQ，或发送 /群管 帮助",
+            "unsupport_tips": "请升级 QQ，或发送 /帮助",
         }
         if spec.kind == "callback":
             action["data"] = encode_callback(
@@ -109,7 +109,7 @@ def build_payload(
                 },
             )
         else:
-            action.update({"data": f"/群管 {spec.command}", "enter": False})
+            action.update({"data": f"/{spec.command}", "enter": False})
 
         button: dict[str, Any] = {
             "id": f"qqadmin_{index}",
@@ -152,7 +152,7 @@ def home_panel() -> Panel:
         body=(
             "选择需要查看的内容。按钮仅供打开此面板的用户操作。\n"
             "管理操作会再次校验当前群身份；入群策略仅限机器人超级管理员。\n"
-            "需要填写目标或参数时，请使用 /群管 帮助 中的命令。"
+            "也可以直接发送 /禁言 @成员 10m、/解禁 @成员。更多命令见 /帮助。"
         ),
         buttons=[
             ButtonSpec("群信息", "信息"),
@@ -172,45 +172,47 @@ def help_panel() -> Panel:
     return Panel(
         title="群管使用帮助",
         body=(
-            "在本群 @机器人 后发送 /群管 命令。参数用空格分隔；多个成员 OpenID 用逗号分隔。\n"
-            "OpenID 来自本群成员列表或“身份”，不可用 QQ 号替代。策略白名单按官方接口使用 QQ 号。\n\n"
+            "直接使用下方短命令，无需添加前缀。请在 QQ 中选择真实的 @成员。\n"
+            "若机器人只能接收 @它的消息，请同时 @机器人；机器人自身不会作为操作目标。\n"
+            "成员目标也可填写 /成员 中的 OpenID；多个 OpenID 用逗号分隔。策略白名单使用 QQ 号。\n\n"
             "查看信息\n"
-            "/群管 面板｜帮助｜身份｜信息｜状态\n"
-            "/群管 成员 [cursor]\n"
-            "/群管 成员详情 openid\n"
-            "/群管 禁言状态\n"
-            "/群管 黑名单 [cursor]\n"
-            "/群管 入群 [cursor]\n"
-            "/群管 最近消息\n"
-            "/群管 日志\n\n"
+            "/面板｜/帮助｜/身份｜/信息｜/状态\n"
+            "/成员 [cursor]\n"
+            "/成员详情 @成员\n"
+            "/禁言状态\n"
+            "/黑名单 [cursor]\n"
+            "/入群 [cursor]\n"
+            "/最近消息\n"
+            "/日志\n\n"
             "成员管理\n"
-            "/群管 禁言 openids 10m\n"
-            "/群管 更新禁言 openids 10m\n"
-            "/群管 解禁 openids\n"
-            "/群管 移出 openids [拉黑]\n"
-            "/群管 拉黑 openids\n"
-            "/群管 取消拉黑 openids\n"
-            "时长示例：60s、10m、2h、1d；可用范围由接口及命令校验决定。\n\n"
+            "/禁言 @成员 [时长]\n"
+            "/禁言 @成员A @成员B 10m\n"
+            "/更新禁言 @成员 [时长]\n"
+            "/解禁 @成员\n"
+            "/移出 @成员 [拉黑]\n"
+            "/拉黑 openids\n"
+            "/取消拉黑 openids\n"
+            "禁言或更新禁言不填时长默认 10 分钟。时长示例：600（秒）、10m、30分钟、2h、1d；最长 30 天。\n\n"
             "入群审核\n"
-            "/群管 同意 member request\n"
-            "/群管 拒绝 member request [reason]\n"
+            "/同意 member request\n"
+            "/拒绝 member request [reason]\n"
             "member 与 request 请从待处理入群申请中获取。\n\n"
             "入群策略（机器人超级管理员）\n"
-            "/群管 策略列表 [cursor]\n"
-            "/群管 策略创建 JSON\n"
-            "/群管 策略修改 id JSON\n"
-            "/群管 策略删除 id\n"
-            "/群管 策略执行 id\n"
-            "/群管 策略白名单 id add|del qq逗号列表\n\n"
+            "/策略列表 [cursor]\n"
+            "/策略创建 JSON\n"
+            "/策略修改 id JSON\n"
+            "/策略删除 id\n"
+            "/策略执行 id\n"
+            "/策略白名单 id add|del qq逗号列表\n\n"
             "消息管理\n"
-            "/群管 撤回 messageid\n"
-            "/群管 通知 text\n"
-            "/群管 全体通知 text\n"
+            "/撤回 messageid\n"
+            "/通知 text\n"
+            "/全体通知 text\n"
             "撤回限 2 分钟内；撤回普通成员消息要求机器人是群管理员。\n"
             "全体通知要求机器人是群管理员，每群每个自然日限 1 次。\n\n"
             "涉及修改的操作请核对确认面板；按钮不可用时发送：\n"
-            "/群管 确认 token\n"
-            "/群管 取消 token"
+            "/确认 token\n"
+            "/取消 token"
         ),
         buttons=[ButtonSpec("返回面板", "面板"), ButtonSpec("我的身份", "身份")],
     )

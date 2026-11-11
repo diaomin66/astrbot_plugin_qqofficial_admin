@@ -54,7 +54,7 @@ class PanelTests(unittest.TestCase):
         panel = Panel("输入操作", "请填写目标", [ButtonSpec("填写禁言", "禁言 ", "input")])
         button = self.buttons(build_payload(panel, self.ctx, self.encode))[0]
         self.assertEqual(button["action"]["type"], 2)
-        self.assertEqual(button["action"]["data"], "/群管 禁言 ")
+        self.assertEqual(button["action"]["data"], "/禁言 ")
         self.assertIs(button["action"]["enter"], False)
         self.assertEqual(self.encoded_calls, [])
 

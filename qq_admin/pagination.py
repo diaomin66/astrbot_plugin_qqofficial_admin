@@ -211,11 +211,11 @@ class ResultPager:
         if index > 0:
             command = f"结果 {token} {index - 1}"
             navigation.append(ButtonSpec("上一段", command))
-            footer += f"\n上一段：/群管 {command}"
+            footer += f"\n上一段：/{command}"
         if index + 1 < total:
             command = f"结果 {token} {index + 1}"
             navigation.append(ButtonSpec("下一段", command))
-            footer += f"\n下一段：/群管 {command}"
+            footer += f"\n下一段：/{command}"
         return Panel(
             title=f"{snapshot.title}（{index + 1}/{total}）",
             body=snapshot.chunks[index] + footer,

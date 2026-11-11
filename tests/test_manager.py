@@ -152,6 +152,30 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(595 < (expires - datetime.now(UTC)).total_seconds() <= 600)
         self.assertEqual(body["members"][0]["op"], "add")
 
+    async def test_mute_without_duration_previews_and_executes_ten_minutes(self):
+        panel = await self.manager.handle(self.ctx, "禁言 target", self.api)
+        self.assertIn("600 秒", panel.body)
+        self.assertIn("/确认 ", panel.body)
+        self.assertNotIn("/群管", panel.body)
+        self.assertEqual(self.transport.calls, [])
+        await self.manager.handle(self.ctx, panel.buttons[0].command, self.api)
+        body = self.transport.calls[0][2]
+        self.assertEqual(body["members"][0]["member_openid"], "target")
+        expires = datetime.fromisoformat(body["members"][0]["mute_expire_at"])
+        self.assertTrue(595 < (expires - datetime.now(UTC)).total_seconds() <= 600)
+
+    async def test_mute_without_target_or_with_only_duration_is_rejected(self):
+        for command in ("禁言", "禁言 10m", "更新禁言 600", "禁言 30分钟"):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                await self.manager.handle(self.ctx, command, self.api)
+        self.assertEqual(self.transport.calls, [])
+
+    async def test_numeric_member_openid_remains_a_valid_default_mute_target(self):
+        member = "12345678901234567890123456789012"
+        confirmation = await self.prepare(f"禁言 {member}")
+        await self.manager.handle(self.ctx, confirmation, self.api)
+        self.assertEqual(self.transport.calls[0][2]["members"][0]["member_openid"], member)
+
     async def test_success_http_status_with_invalid_body_is_still_uncertain(self):
         confirmation = await self.prepare("移出 target")
         self.transport.failure = QQAPIError(200, "INVALID_RESPONSE", "invalid JSON")
