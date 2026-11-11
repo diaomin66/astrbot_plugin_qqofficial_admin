@@ -1,0 +1,55 @@
+{
+  "enabled": {
+    "description": "启用 QQ 官方群管",
+    "type": "bool",
+    "default": true
+  },
+  "allowed_groups": {
+    "description": "允许使用的群 OpenID",
+    "type": "list",
+    "default": [],
+    "hint": "留空允许所有机器人所在群。填写 group_openid，不是 QQ 群号；使用 /群管 身份 查看。"
+  },
+  "allow_group_admins": {
+    "description": "允许经官方接口验证的群主和管理员使用群管",
+    "type": "bool",
+    "default": true,
+    "hint": "每次操作查询官方 member_role；成员信息接口需要内邀/白名单。查询失败不会授予权限，可以配置下面的受信任管理员。"
+  },
+  "trusted_admins": {
+    "description": "额外授权的群管理员",
+    "type": "list",
+    "default": [],
+    "hint": "每项格式：平台ID|群OpenID|成员OpenID。使用 /群管 身份 获取准确值。仅授予该平台该群的操作权限；不能管理机器人全局审批策略。AstrBot 管理员自动拥有管理权限。"
+  },
+  "confirm_timeout": {
+    "description": "操作确认有效期（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "允许 30–300 秒。写入操作必须通过按钮或 /群管 确认 令牌 再次确认；重启后确认状态保留。"
+  },
+  "use_markdown": {
+    "description": "使用原生 Markdown 和按钮面板",
+    "type": "bool",
+    "default": true,
+    "hint": "发送明确被平台拒绝时自动降级为文本命令。按钮需要开放平台 INTERACTION_CREATE 事件订阅和账号实际权限。"
+  },
+  "request_timeout": {
+    "description": "官方 API 请求超时（秒）",
+    "type": "int",
+    "default": 15,
+    "hint": "允许 5–60 秒。写操作超时不会自动重试，避免重复执行。"
+  },
+  "audit_retention_days": {
+    "description": "操作日志保留天数",
+    "type": "int",
+    "default": 30,
+    "hint": "允许 1–365 天。日志保存在插件数据目录 SQLite 中，包含操作者、操作参数、结果，不保存聊天正文或应用凭据。"
+  },
+  "remember_messages": {
+    "description": "临时记录最近消息 ID，方便撤回",
+    "type": "bool",
+    "default": true,
+    "hint": "仅在内存保存各群最近 120 秒的消息 ID、成员 OpenID 和时间，不保存正文。可见范围受平台的 @消息/全量消息接收权限限制。"
+  }
+}

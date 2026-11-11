@@ -1,0 +1,10 @@
+name: astrbot_plugin_qqofficial_admin
+display_name: QQ 官方群管
+desc: 覆盖 QQ 官方群管理接口，支持原生按钮、禁言、成员与黑名单管理、入群审批和自动审批策略。
+version: v1.0.0
+author: QQ Official Admin Contributors
+repo: https://github.com/diaomin66/astrbot_plugin_qqofficial_admin
+astrbot_version: '>=4.29.4'
+support_platforms:
+  - qq_official
+  - qq_official_webhook
