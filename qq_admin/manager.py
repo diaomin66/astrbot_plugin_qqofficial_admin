@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .api import QQAPIError, QQGroupAPI
+from .diagnostics import RequestState, current_request_state
 from .official_menu import OfficialMenu
 from .pagination import ResultPager
 from .panels import ButtonSpec, Panel, help_panel, home_panel
@@ -448,24 +449,75 @@ class AdminManager:
     async def _run_write(
         self, ctx: Any, action: str, params: dict, summary: str, audit_id: int, api: QQGroupAPI
     ) -> Panel:
+        # Each command owns its state even when commands share one transport.
+        state = RequestState()
+        token = current_request_state.set(state)
+        try:
+            return await self._run_tracked_write(ctx, action, params, summary, audit_id, api, state)
+        finally:
+            current_request_state.reset(token)
+
+    async def _run_tracked_write(
+        self,
+        ctx: Any,
+        action: str,
+        params: dict,
+        summary: str,
+        audit_id: int,
+        api: QQGroupAPI,
+        state: RequestState,
+    ) -> Panel:
         try:
             result = await self._execute(ctx, action, params, api)
         except asyncio.CancelledError:
             await asyncio.shield(
-                self._finish(audit_id, "unknown", "任务被中断，请查询官方状态确认结果。")
+                self._finish(
+                    audit_id,
+                    "unknown" if state.mutation_started else "failed",
+                    "任务被中断，请查询官方状态确认结果。"
+                    if state.mutation_started
+                    else "任务在发送修改请求前被中断，未执行操作。",
+                )
             )
             raise
         except QQAPIError as exc:
-            unknown = (
-                exc.code == "INVALID_RESPONSE"
-                or (exc.status == 0 and exc.code not in {"AUTH_UNAVAILABLE", "TRANSPORT_CLOSED"})
+            mutation_sent = state.mutation_started and not (
+                exc.request_sent is False and exc.method in {"POST", "PUT", "PATCH", "DELETE"}
+            )
+            unknown = mutation_sent and (
+                exc.code in ("INVALID_RESPONSE", "TIMEOUT", "NETWORK_ERROR")
+                or (exc.status == 0 and exc.code not in ("AUTH_UNAVAILABLE", "TRANSPORT_CLOSED"))
                 or exc.status >= 500
             )
-            await self._finish(audit_id, "unknown" if unknown else "failed", exc.user_message())
-            title = "操作结果尚未确认" if unknown else "官方接口未执行成功"
-            suffix = "\n本次请求不会自动重试。请先查询实际状态，再决定是否发送新指令。"
-            return Panel(title, exc.user_message() + suffix, [HOME])
+            if not mutation_sent:
+                title = "未执行操作"
+                suffix = "\n未发送修改请求。本次请求不会自动重试，请根据诊断检查后重新发起。"
+            elif unknown:
+                title = "操作结果尚未确认"
+                check = "发送 /菜单状态 查询" if action in {"设置菜单", "移除菜单"} else "查询"
+                suffix = f"\n本次请求不会自动重试。请先{check}实际状态，再决定是否发送新指令。"
+            else:
+                title = "官方接口未执行成功"
+                suffix = "\n本次请求不会自动重试。请检查参数及接口权限后发送新指令。"
+            detail = exc.user_message() + suffix
+            status = "unknown" if unknown else "failed"
+            await self._finish(audit_id, status, detail)
+            logger.warning(
+                "QQ group administration /%s (audit %s, %s): %s",
+                action,
+                audit_id,
+                status,
+                exc.user_message(),
+            )
+            return Panel(title, f"指令：/{action}\n" + detail, [HOME])
         except ValueError as exc:
+            if state.mutation_started:
+                await self._finish(audit_id, "unknown", "修改请求已发起，但后续校验未完成。")
+                return Panel(
+                    "操作结果尚未确认",
+                    f"修改请求已发起，但后续校验未完成，操作记录 #{audit_id}。请先查询实际状态。",
+                    [HOME],
+                )
             await self._finish(audit_id, "failed", str(exc))
             return Panel(
                 "参数未通过校验", str(exc) + "\n未发送此操作，请修正参数后重新发起。", [HOME]
@@ -473,11 +525,17 @@ class AdminManager:
         except Exception:
             # Once claimed, an unexpected exception must not silently make the
             # same mutation available again. Do not reflect exception secrets.
-            await self._finish(audit_id, "unknown", "内部异常，请查询实际状态后再操作。")
+            unknown = state.mutation_started
+            message = (
+                "发生内部异常，请先查询实际状态。"
+                if unknown
+                else "发送修改请求前发生内部异常，未执行操作。"
+            )
+            await self._finish(audit_id, "unknown" if unknown else "failed", message)
             logger.error("QQ group administration execution failed (audit %s)", audit_id)
             return Panel(
-                "操作结果尚未确认",
-                f"发生内部异常，操作记录 #{audit_id}。请先查询实际状态。",
+                "操作结果尚未确认" if unknown else "未执行操作",
+                f"{message}\n操作记录 #{audit_id}。",
                 [HOME],
             )
         failures = result.get("fail_openids") or result.get("add_to_member_blacklist_fail_openids")

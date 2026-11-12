@@ -90,11 +90,36 @@ QQ 官方已提供原生指令面板的公开管理接口。2026-08-12 的官方
 
 插件采用带群标识的专属备注，并在同一机器人内串行执行“查询现有面板 → 更新或创建”。重复安装应更新本插件当前群面板，避免持续新增占满 20 个配额。平台上其他用途的面板应保持原样；发现关联范围或所属标记不符时，不应接管。删除整份面板会对其所有关联群生效，必须先核对详情。
 
+## 异常响应与排查
+
+v1.2.1 中，`INVALID_RESPONSE` 表示插件无法解析响应，或关键字段无法通过校验。这是本地诊断代码；仅凭这个代码无法判断具体接口、权限情况或修改是否已执行。
+
+- 查询列表或详情失败，且尚未发送修改请求：提示「未执行操作」，审计记为 `failed`。
+- 已发出修改请求，但响应无法确认结果：提示「操作结果尚未确认」，审计记为 `unknown`，不会自动重发写请求。
+- 菜单创建响应缺少有效 `panel_id`、更新响应缺少有效 `version`，或这两个接口的成功响应无法解析：插件尝试一次只读核实。创建操作重新遍历列表并读取详情，更新操作直接读取已知面板详情；仅在面板唯一性（创建时）、归属标记、当前群关联和完整命令内容全部符合预期后报告完成。核实失败仍保留原写请求的异常诊断。超时和服务端错误不触发这项恢复。
+
+列表仍要求 `records` 为数组。分页可使用 `is_end=true` 或显式 `next_cursor=""` 任一结束信号；两者同时存在时必须一致，缺少结束及进展信息、字段类型错误、游标循环都会停止安装。不会把空对象或 `records=null` 当作“没有菜单”。这是根据文档字段语义做的兼容处理，官方示例仍同时返回两项分页字段。
+
+错误回复和 AstrBot 日志包含固定的指令名、脱敏的接口路径模板、实际 HTTP 状态（有响应时）、安全格式的 TraceID，以及失败字段、预期/实际类型。例如：
+
+```text
+未执行操作
+指令：/设置菜单
+QQ 接口返回的响应无法通过校验。
+诊断：GET /v2/panels HTTP=200 错误码 INVALID_RESPONSE TraceID example_trace reason=field_type field=records expected=list actual=null request_sent=true
+未发送修改请求。本次请求不会自动重试，请根据诊断检查后重新发起。
+```
+
+`request_sent=true` 表示该诊断对应的 HTTP 请求已尝试发送；上例是 GET 查询，不表示已修改菜单。诊断不输出真实群/成员/面板 ID、游标、令牌、消息正文或原始响应。TraceID 优先取响应头，也支持官方调用指南中的响应体 `trace_id`。
+
+遇到旧版泛化的 `INVALID_RESPONSE` 提示，先升级并重载插件。如失败指令是 `/设置菜单`，先发送 `/菜单状态` 查看当前菜单，避免已成功创建后盲目重建。再次出现异常时，反馈触发指令和完整的新版诊断行即可，无需提供 AppSecret、access_token 或原始响应。由于没有真实账号响应，仅能据诊断继续定位，不能将所有 `INVALID_RESPONSE` 都归因于某一种字段差异。
+
 ## 官方核验来源
 
 以下是当前官方文档 v1.48.0 中公开的能力说明；原生面板接口页更新于 2026-08-13，单聊菜单页更新于 2026-10-09。
 
 - [自定义菜单与指令面板概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/menu-panel/)
+- [API 调用指南（成功响应及 TraceID）](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/api-call-guide.html)
 - [2026-08-12 变更记录](https://bot.q.qq.com/wiki/develop/api-v2/changelog.html)
 - [查询指令面板列表](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_panels.get.html)
 - [创建指令面板](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_panels.post.html)

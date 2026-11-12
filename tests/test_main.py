@@ -249,6 +249,36 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args[1], "信息")
         self.assertEqual(self.sender.await_count, 2)
 
+    async def test_api_error_reply_and_log_identify_command_without_arguments_or_upstream_body(
+        self,
+    ):
+        self.plugin._manager.handle.side_effect = QQAPIError(
+            200,
+            "INVALID_RESPONSE",
+            "Authorization: private-credential private-notice-body",
+            trace_id="trace-abc",
+            method="GET",
+            route="/v2/groups/{group_openid}/members/{member_openid}",
+            reason="root_type",
+            expected="object",
+            actual="array",
+        )
+        event = FakeEvent("/通知 private-notice-body")
+        with (
+            self.assertLogs("qqadmin.entrypoint.test", level="WARNING") as logs,
+            patch.object(self.plugin, "_deliver", wraps=self.plugin._deliver) as deliver,
+        ):
+            await self.handler("command")(event)
+        panel = deliver.await_args.args[1]
+        shown = panel.body + "\n" + "\n".join(logs.output)
+        self.assertIn("/通知", shown)
+        self.assertIn("trace-abc", shown)
+        self.assertIn("root_type", shown)
+        self.assertNotIn("private-credential", shown)
+        self.assertNotIn("private-notice-body", shown)
+        self.assertNotIn("member-1", shown)
+        self.assertNotIn("group-1", shown)
+
     async def test_direct_commands_and_old_prefixes_reach_the_same_action(self):
         for text in (
             "/禁言 target 10m",

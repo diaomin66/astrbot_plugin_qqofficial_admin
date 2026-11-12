@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import unittest
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
-from qq_admin.api import QQAPIError, QQGroupAPI
+from qq_admin.api import QQAPIError, QQGroupAPI, QQResponse
+from qq_admin.diagnostics import RequestState, current_request_state, route_template
 
 
 class RecordingTransport:
@@ -26,6 +30,108 @@ class APIContractTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.transport = RecordingTransport()
         self.api = QQGroupAPI(self.transport)
+
+    async def test_compatible_transport_marks_only_writes_after_parameter_validation(self):
+        state = RequestState()
+        token = current_request_state.set(state)
+        try:
+            await self.api.get_group_info("g")
+            self.assertFalse(state.mutation_started)
+            with self.assertRaises(ValueError):
+                await self.api.remove_members("g", [])
+            self.assertFalse(state.mutation_started)
+            await self.api.remove_members("g", ["m"])
+            self.assertTrue(state.mutation_started)
+            await self.api.get_group_info("g")
+            self.assertTrue(state.mutation_started)
+        finally:
+            current_request_state.reset(token)
+
+    async def test_transport_with_precise_tracking_owns_the_send_boundary(self):
+        self.transport.tracks_mutations = True
+        state = RequestState()
+        token = current_request_state.set(state)
+        try:
+            await self.api.remove_members("g", ["m"])
+            self.assertFalse(state.mutation_started)
+        finally:
+            current_request_state.reset(token)
+
+    async def test_concurrent_commands_have_independent_mutation_states(self):
+        write_started, read_started = asyncio.Event(), asyncio.Event()
+        observed = {}
+
+        async def request(method, path, **kwargs):
+            if method == "POST":
+                write_started.set()
+                await read_started.wait()
+            else:
+                await write_started.wait()
+                read_started.set()
+            await asyncio.sleep(0)
+            observed[method] = current_request_state.get().mutation_started
+            return {}
+
+        self.transport.request = request
+
+        async def execute(write):
+            state = RequestState()
+            token = current_request_state.set(state)
+            try:
+                if write:
+                    await self.api.remove_members("g", ["m"])
+                else:
+                    await self.api.get_group_info("g")
+                return state
+            finally:
+                current_request_state.reset(token)
+
+        parent_state = current_request_state.get()
+        write, read = await asyncio.gather(execute(True), execute(False))
+        self.assertIsNot(write, read)
+        self.assertEqual(observed, {"POST": True, "GET": False})
+        self.assertIs(current_request_state.get(), parent_state)
+
+    async def test_compatible_errors_get_request_context_without_claiming_a_send(self):
+        error = QQAPIError(0, "AUTH_UNAVAILABLE", "private credential", request_sent=False)
+        self.transport.request = AsyncMock(side_effect=error)
+        with self.assertRaises(QQAPIError) as caught:
+            await self.api.remove_members("private-group", ["private-member"])
+        error = caught.exception
+        self.assertEqual(error.method, "POST")
+        self.assertEqual(error.route, "/v2/groups/{group_openid}/batch_remove_members")
+        self.assertFalse(error.request_sent)
+        self.assertEqual(str(error), error.user_message())
+        self.assertNotIn("private", repr(error))
+
+    async def test_response_metadata_is_preserved_and_legacy_empty_results_are_wrapped(self):
+        response = QQResponse(
+            {"panel_id": "p"},
+            status=201,
+            trace_id="trace-create",
+            method="POST",
+            route="/v2/panels",
+        )
+        self.transport.response = response
+        self.assertIs(await self.api._request("POST", "/v2/panels"), response)
+        self.transport.response = None
+        empty = await self.api.delete_panel("p")
+        self.assertIsInstance(empty, QQResponse)
+        self.assertEqual(empty, {})
+        self.assertEqual(empty.status, 0)
+        self.assertEqual(empty.method, "DELETE")
+        self.assertEqual(empty.route, "/v2/panels/{panel_id}")
+
+    async def test_compatible_transport_non_object_response_has_safe_type_diagnostics(self):
+        self.transport.response = ["private response text"]
+        with self.assertRaises(QQAPIError) as caught:
+            await self.api.get_group_info("private-group")
+        error = caught.exception
+        self.assertEqual(error.reason, "root_type")
+        self.assertEqual(error.expected, "object")
+        self.assertEqual(error.actual, "array")
+        self.assertTrue(error.request_sent)
+        self.assertNotIn("private", error.user_message())
 
     async def test_all_seventeen_management_endpoints(self):
         """The official group API must never silently use guild endpoints."""
@@ -451,6 +557,151 @@ class APIContractTests(unittest.IsolatedAsyncioTestCase):
                 500, "Authorization:secret", "secret", "Authorization:secret"
             ).user_message(),
         )
+
+
+class DiagnosticTests(unittest.TestCase):
+    def test_error_code_field_type_diagnostics_survive_request_context_enrichment(self):
+        for field in ("err_code", "code"):
+            with self.subTest(field=field):
+                error = QQAPIError(
+                    200,
+                    "INVALID_RESPONSE",
+                    "private response body",
+                    reason="field_type",
+                    field=field,
+                    expected="integer_or_string_or_null",
+                    actual="object",
+                ).with_request_context(method="GET", route="/v2/panels", request_sent=True)
+                self.assertEqual(error.field, field)
+                self.assertEqual(error.expected, "integer_or_string_or_null")
+                self.assertEqual(error.actual, "object")
+                self.assertIn(f"field={field}", error.diagnostic_text())
+                self.assertEqual(str(error), error.user_message())
+                self.assertNotIn("private", repr(error))
+
+    def test_all_documented_routes_use_fixed_templates(self):
+        routes = {
+            "/v2/groups/private-group/info": "/v2/groups/{group_openid}/info",
+            "/v2/groups/private-group/bot_state": "/v2/groups/{group_openid}/bot_state",
+            "/v2/groups/private-group/members": "/v2/groups/{group_openid}/members",
+            "/v2/groups/private-group/members/private-member": (
+                "/v2/groups/{group_openid}/members/{member_openid}"
+            ),
+            "/v2/groups/private-group/batch_remove_members": (
+                "/v2/groups/{group_openid}/batch_remove_members"
+            ),
+            "/v2/groups/private-group/member_blacklist": (
+                "/v2/groups/{group_openid}/member_blacklist"
+            ),
+            "/v2/groups/private-group/restrict_chat_setting": (
+                "/v2/groups/{group_openid}/restrict_chat_setting"
+            ),
+            "/v2/groups/private-group/join_request_list": (
+                "/v2/groups/{group_openid}/join_request_list"
+            ),
+            "/v2/groups/private-group/approval_join_request/private-member": (
+                "/v2/groups/{group_openid}/approval_join_request/{member_openid}"
+            ),
+            "/v2/groups/join_approval_strategy": "/v2/groups/join_approval_strategy",
+            "/v2/groups/join_approval_strategy/private-strategy": (
+                "/v2/groups/join_approval_strategy/{strategy_id}"
+            ),
+            "/v2/groups/join_approval_strategy/private-strategy/execute": (
+                "/v2/groups/join_approval_strategy/{strategy_id}/execute"
+            ),
+            "/v2/groups/join_approval_strategy/private-strategy/whitelist_users": (
+                "/v2/groups/join_approval_strategy/{strategy_id}/whitelist_users"
+            ),
+            "/v2/panels": "/v2/panels",
+            "/v2/panels/private-panel": "/v2/panels/{panel_id}",
+            "/v2/panels/private-panel/target": "/v2/panels/{panel_id}/target",
+            "/v2/groups/private-group/messages": "/v2/groups/{group_openid}/messages",
+            "/v2/groups/private-group/messages/private-message": (
+                "/v2/groups/{group_openid}/messages/{message_id}"
+            ),
+        }
+        for path, expected in routes.items():
+            with self.subTest(path=path):
+                self.assertEqual(route_template(path), expected)
+                self.assertNotIn("private", route_template(path))
+        for path in (
+            "/private-unknown-route",
+            "/v2/panels?cursor=private",
+            "/v2/panels/private\n",
+            "/v2/panels/private/unknown",
+            "https://api.bot.qq.com/v2/panels",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(route_template(path), "unknown")
+
+    def test_field_diagnostics_do_not_echo_response_or_command_values(self):
+        error = QQAPIError(
+            200,
+            "INVALID_RESPONSE",
+            "private notification body and credential",
+            trace_id="trace_123",
+            method="GET",
+            route="/v2/panels",
+            reason="field_type",
+            field="records[].panel",
+            expected="object",
+            actual="null",
+            request_sent=True,
+        )
+        for expected in (
+            "GET /v2/panels",
+            "HTTP=200",
+            "INVALID_RESPONSE",
+            "trace_123",
+            "reason=field_type",
+            "field=records[].panel",
+            "expected=object",
+            "actual=null",
+            "request_sent=true",
+        ):
+            self.assertIn(expected, error.diagnostic_text())
+        self.assertIn(error.diagnostic_text(), error.user_message())
+        self.assertEqual(str(error), error.user_message())
+        self.assertNotIn("private", repr(error))
+        for code in ("INVALID_RESPONSE", "TIMEOUT", "NETWORK_ERROR"):
+            self.assertNotIn("结果尚未确认", QQAPIError(0, code, "ignored").user_message())
+
+    def test_untrusted_diagnostic_labels_and_literal_routes_are_discarded(self):
+        error = QQAPIError(
+            9999,
+            "Authorization: private-token",
+            "private-body",
+            trace_id="private\ntrace",
+            method="POST private-data",
+            route="/v2/panels/private-panel",
+            reason="private-reason",
+            field="records.private-key",
+            expected="private-expectation",
+            actual="private-value",
+            request_sent="private-value",
+        )
+        self.assertEqual(error.status, 0)
+        self.assertEqual(error.route, "unknown")
+        self.assertIsNone(error.request_sent)
+        self.assertNotIn("private", error.user_message())
+        self.assertNotIn("private", error.diagnostic_text())
+        self.assertNotIn("private", repr(error))
+
+    def test_response_metadata_does_not_change_business_json(self):
+        result = QQResponse(
+            {"records": []},
+            status=200,
+            trace_id="trace-1",
+            method="GET",
+            route="/v2/panels",
+        )
+        self.assertEqual(json.loads(json.dumps(result)), {"records": []})
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.trace_id, "trace-1")
+        result = QQResponse({}, status=True, trace_id="invalid trace", route="/private-id")
+        self.assertEqual(result.status, 0)
+        self.assertEqual(result.trace_id, "")
+        self.assertEqual(result.route, "unknown")
 
 
 if __name__ == "__main__":

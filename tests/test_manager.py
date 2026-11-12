@@ -4,8 +4,10 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from qq_admin.api import QQAPIError, QQGroupAPI
+from qq_admin.diagnostics import current_request_state
 from qq_admin.integration import EventContext
 from qq_admin.manager import AdminManager, duration_seconds
 from qq_admin.pagination import MAX_SNAPSHOT_CHARACTERS
@@ -234,6 +236,141 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         panel = await self.manager.handle(self.ctx, "移出 target", self.api)
         self.assertEqual(panel.title, "操作结果尚未确认")
         self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "unknown")
+
+    async def test_success_headers_with_unreadable_body_are_still_uncertain(self):
+        for code in ("TIMEOUT", "NETWORK_ERROR"):
+            with self.subTest(code=code):
+                self.transport.calls.clear()
+                self.transport.failure = QQAPIError(201, code, "response body incomplete")
+                ctx = replace(self.ctx, message_id=f"body-{code}")
+                panel = await self.manager.handle(ctx, "移出 target", self.api)
+                self.assertEqual(panel.title, "操作结果尚未确认")
+                self.assertEqual(len(self.transport.calls), 1)
+                self.assertEqual((await self.store.recent_audit(ctx))[0]["status"], "unknown")
+
+    async def test_malformed_upstream_error_code_cannot_break_audit_failure_handling(self):
+        self.transport.failure = QQAPIError(503, {"unexpected": "private-value"}, "opaque")
+        panel = await self.manager.handle(self.ctx, "移出 target", self.api)
+        self.assertEqual(panel.title, "操作结果尚未确认")
+        self.assertNotIn("private-value", panel.body)
+        self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "unknown")
+
+    async def test_menu_preflight_errors_never_claim_a_modification_was_attempted(self):
+        failures = [
+            QQAPIError(200, "INVALID_RESPONSE", "unsafe upstream message"),
+            QQAPIError(0, "TIMEOUT", "unsafe upstream message"),
+            QQAPIError(503, 503, "unsafe upstream message"),
+        ]
+        for command in ("设置菜单", "移除菜单"):
+            for index, failure in enumerate(failures):
+                with self.subTest(command=command, failure=failure.code):
+                    self.transport.calls.clear()
+                    self.transport.failure = failure
+                    ctx = replace(self.ctx, message_id=f"preflight-{command}-{index}")
+                    panel = await self.manager.handle(ctx, command, self.api)
+                    self.assertEqual(panel.title, "未执行操作")
+                    self.assertIn("未发送修改请求", panel.body)
+                    self.assertNotIn("操作结果尚未确认", panel.body)
+                    self.assertNotIn("unsafe upstream message", panel.body)
+                    self.assertEqual([call[0] for call in self.transport.calls], ["GET"])
+                    audit = (await self.store.recent_audit(ctx))[0]
+                    self.assertEqual(audit["status"], "failed")
+                    with self.assertRaises(ValueError):
+                        await self.manager.handle(ctx, command, self.api)
+
+    async def test_menu_invalid_list_explains_field_without_creating_a_panel(self):
+        self.transport.result = {"records": None, "is_end": True, "next_cursor": ""}
+        panel = await self.manager.handle(self.ctx, "设置菜单", self.api)
+        self.assertEqual(panel.title, "未执行操作")
+        self.assertIn("/设置菜单", panel.body)
+        self.assertIn("GET /v2/panels", panel.body)
+        self.assertIn("records", panel.body)
+        self.assertIn("null", panel.body)
+        self.assertEqual([call[0] for call in self.transport.calls], ["GET"])
+        self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "failed")
+
+    async def test_cancellation_before_and_after_write_is_audited_separately(self):
+        self.transport.failure = asyncio.CancelledError()
+        for command, status, method in (
+            ("设置菜单", "failed", "GET"),
+            ("移出 target", "unknown", "POST"),
+        ):
+            with self.subTest(command=command):
+                self.transport.calls.clear()
+                ctx = replace(self.ctx, message_id=f"cancel-{method}")
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.manager.handle(ctx, command, self.api)
+                self.assertEqual((await self.store.recent_audit(ctx))[0]["status"], status)
+                self.assertEqual([call[0] for call in self.transport.calls], [method])
+                self.assertIsNone(current_request_state.get())
+
+    async def test_internal_failure_before_and_after_write_does_not_expose_exception(self):
+        for command, status, title in (
+            ("设置菜单", "failed", "未执行操作"),
+            ("移出 target", "unknown", "操作结果尚未确认"),
+        ):
+            self.transport.failure = RuntimeError("private credential should never be shown")
+            ctx = replace(self.ctx, message_id=f"exception-{status}")
+            panel = await self.manager.handle(ctx, command, self.api)
+            self.assertEqual(panel.title, title)
+            self.assertNotIn("private credential", panel.body)
+            self.assertEqual((await self.store.recent_audit(ctx))[0]["status"], status)
+            self.assertIsNone(current_request_state.get())
+
+    async def test_concurrent_menu_preflight_does_not_inherit_another_commands_write_state(self):
+        write_started = asyncio.Event()
+        finish_write = asyncio.Event()
+
+        async def request(method, path, **kwargs):
+            self.transport.calls.append((method, path, kwargs))
+            if method == "POST":
+                write_started.set()
+                await finish_write.wait()
+                raise QQAPIError(0, "TIMEOUT", "write timeout")
+            await write_started.wait()
+            return {"records": None, "is_end": True}
+
+        self.transport.request = AsyncMock(side_effect=request)
+        write_ctx = replace(self.ctx, message_id="concurrent-write")
+        menu_ctx = replace(self.ctx, message_id="concurrent-menu")
+        task = asyncio.create_task(self.manager.handle(write_ctx, "移出 target", self.api))
+        try:
+            menu = await self.manager.handle(menu_ctx, "设置菜单", self.api)
+        finally:
+            finish_write.set()
+            write = await task
+        self.assertEqual(menu.title, "未执行操作")
+        self.assertEqual(write.title, "操作结果尚未确认")
+        audit = {row["action"]: row["status"] for row in await self.store.recent_audit(self.ctx)}
+        self.assertEqual(audit, {"设置菜单": "failed", "移出": "unknown"})
+        self.assertIsNone(current_request_state.get())
+
+    async def test_menu_failed_readback_keeps_original_write_uncertain(self):
+        results = iter(
+            [
+                {"records": [], "is_end": True, "next_cursor": ""},
+                {},
+                QQAPIError(0, "TIMEOUT", "readback failed", method="GET", request_sent=True),
+            ]
+        )
+
+        async def request(method, path, **kwargs):
+            self.transport.calls.append((method, path, kwargs))
+            result = next(results)
+            if isinstance(result, QQAPIError):
+                raise result
+            return result
+
+        self.transport.request = AsyncMock(side_effect=request)
+        panel = await self.manager.handle(self.ctx, "设置菜单", self.api)
+        self.assertEqual(panel.title, "操作结果尚未确认")
+        self.assertIn("/菜单状态", panel.body)
+        self.assertIn("INVALID_RESPONSE", panel.body)
+        self.assertIn("POST /v2/panels", panel.body)
+        self.assertEqual([call[0] for call in self.transport.calls], ["GET", "POST", "GET"])
+        self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "unknown")
+        with self.assertRaises(ValueError):
+            await self.manager.handle(self.ctx, "设置菜单", self.api)
 
     async def test_notice_reply_uses_current_button_event(self):
         click = replace(self.ctx, message_id="", event_id="INTERACTION_CREATE:new")

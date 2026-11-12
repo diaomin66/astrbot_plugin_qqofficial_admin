@@ -20,7 +20,8 @@ from urllib.parse import quote
 
 import aiohttp
 
-from .api import QQAPIError
+from .api import QQAPIError, QQResponse
+from .diagnostics import current_request_state, json_type, route_template, safe_trace_id
 
 API_BASE = "https://api.bot.qq.com"
 QQ_PLATFORMS = frozenset({"qq_official", "qq_official_webhook"})
@@ -114,6 +115,8 @@ class BotpyTransport:
     moderation or message operations.
     """
 
+    tracks_mutations = True
+
     def __init__(self, bot: Any, timeout: float = 20) -> None:
         self.bot = bot
         self.timeout = float(timeout)
@@ -159,7 +162,7 @@ class BotpyTransport:
         *,
         json: Mapping[str, Any] | None = None,
         params: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> QQResponse:
         method = method.upper()
         if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             raise ValueError("Unsupported QQ API request method")
@@ -169,69 +172,146 @@ class BotpyTransport:
             or any(character in path for character in ("?", "#", "\\", "\r", "\n"))
         ):
             raise ValueError("QQ API path must be an absolute path without a host or query")
-        if self._closed:
-            raise QQAPIError(0, "TRANSPORT_CLOSED", "插件正在关闭，请稍后重试")
-        headers = await self._headers()
-        if self._closed:
-            raise QQAPIError(0, "TRANSPORT_CLOSED", "插件正在关闭，请稍后重试")
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
-                trust_env=False,
-            )
-        kwargs: dict[str, Any] = {"headers": headers, "allow_redirects": False}
-        if json is not None:
-            kwargs["json"] = dict(json)
-        if params is not None:
-            kwargs["params"] = dict(params)
+        route = route_template(path)
+        request_sent = False
+        status = 0
+        trace_id = ""
         try:
+            if self._closed:
+                raise QQAPIError(0, "TRANSPORT_CLOSED", "插件正在关闭，请稍后重试")
+            headers = await self._headers()
+            if self._closed:
+                raise QQAPIError(0, "TRANSPORT_CLOSED", "插件正在关闭，请稍后重试")
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                    trust_env=False,
+                )
+            kwargs: dict[str, Any] = {"headers": headers, "allow_redirects": False}
+            if json is not None:
+                kwargs["json"] = dict(json)
+            if params is not None:
+                kwargs["params"] = dict(params)
+            credential_parts = (headers["Authorization"], headers["Authorization"].split()[-1])
+
+            def response_trace(value: Any) -> str:
+                candidate = safe_trace_id(value)
+                return "" if any(secret in candidate for secret in credential_parts) else candidate
+
+            state = current_request_state.get()
+            if method != "GET" and state is not None:
+                state.mutation_started = True
+            # Sending has been attempted from this point, including failures
+            # while opening or reading the response. No write is retried.
+            request_sent = True
             async with self._session.request(method, API_BASE + path, **kwargs) as response:
-                text = await response.text()
-                trace_id = response.headers.get("X-Tps-Trace-Id", "")
+                status = response.status
+                trace_id = response_trace(response.headers.get("X-Tps-Trace-Id", ""))
                 try:
-                    result = json_module.loads(text) if text.strip() else None
+                    text = await response.text()
+                except (UnicodeError, LookupError):
+                    raise QQAPIError(
+                        status,
+                        "INVALID_RESPONSE" if 200 <= status < 300 else status,
+                        "QQ 接口返回了无法解码的响应",
+                        trace_id=trace_id,
+                        reason="text_decode",
+                    ) from None
+                empty_body = not text.strip()
+                parse_reason = ""
+                try:
+                    result = {} if empty_body else json_module.loads(text)
                 except (ValueError, TypeError):
                     result = None
-                    if 200 <= response.status < 300:
+                    parse_reason = "json_decode"
+                    if 200 <= status < 300:
                         raise QQAPIError(
-                            response.status,
+                            status,
                             "INVALID_RESPONSE",
                             "QQ 接口返回了无法解析的响应",
                             trace_id=trace_id,
+                            reason=parse_reason,
+                            expected="object",
                         ) from None
-                code = (
-                    result.get("err_code", result.get("code", 0)) if isinstance(result, dict) else 0
-                )
-                if not 200 <= response.status < 300 or code not in (0, "0", None):
+                if not trace_id and isinstance(result, dict):
+                    trace_id = response_trace(result.get("trace_id"))
+                codes: list[int | str | None] = []
+                if isinstance(result, dict):
+                    for field in ("err_code", "code"):
+                        if field not in result:
+                            continue
+                        value = result[field]
+                        if value is not None and type(value) not in (int, str):
+                            raise QQAPIError(
+                                status,
+                                "INVALID_RESPONSE" if 200 <= status < 300 else status,
+                                "QQ 接口返回的错误码字段类型不符合预期",
+                                trace_id=trace_id,
+                                reason="field_type",
+                                field=field,
+                                expected="integer_or_string_or_null",
+                                actual=json_type(value),
+                            )
+                        codes.append(value)
+                # Both documented spellings may appear together. A zero or
+                # null in one must never mask a nonzero error in the other.
+                code = next((value for value in codes if value not in (0, "0", None)), 0)
+                if not 200 <= status < 300 or code not in (0, "0", None):
                     error = result if isinstance(result, dict) else {}
                     message = str(error.get("err_msg") or error.get("message") or "QQ 接口请求失败")
                     # Never reflect a credential even if an upstream error
                     # unexpectedly contains the request's Authorization value.
-                    for secret in (headers["Authorization"], headers["Authorization"].split()[-1]):
+                    for secret in credential_parts:
                         message = message.replace(secret, "[redacted]")
+                    if code == 0:
+                        code = status
+                    if isinstance(code, str) and any(secret in code for secret in credential_parts):
+                        code = "UPSTREAM_ERROR"
                     raise QQAPIError(
-                        response.status,
-                        error.get("err_code", error.get("code", response.status)),
+                        status,
+                        code,
                         message[:500],
                         trace_id=trace_id,
+                        reason=parse_reason,
                     )
-                if result is not None and not isinstance(result, dict):
+                if not isinstance(result, dict):
                     raise QQAPIError(
-                        response.status,
+                        status,
                         "INVALID_RESPONSE",
                         "QQ 接口返回的数据结构不符合预期",
                         trace_id=trace_id,
+                        reason="root_type",
+                        expected="object",
+                        actual=json_type(result),
                     )
-                return result
+                return QQResponse(
+                    result, status=status, trace_id=trace_id, method=method, route=route
+                )
         except asyncio.CancelledError:
             raise
+        except QQAPIError as exc:
+            raise exc.with_request_context(
+                method=method, route=route, request_sent=request_sent
+            ) from None
         except TimeoutError:
             raise QQAPIError(
-                0, "TIMEOUT", "QQ 接口请求超时；操作结果尚未确认，请先查询状态"
+                status,
+                "TIMEOUT",
+                "QQ 接口请求超时",
+                trace_id=trace_id,
+                method=method,
+                route=route,
+                request_sent=request_sent,
             ) from None
         except aiohttp.ClientError:
             raise QQAPIError(
-                0, "NETWORK_ERROR", "QQ 接口连接失败；操作结果尚未确认，请先查询状态"
+                status,
+                "NETWORK_ERROR",
+                "QQ 接口连接失败",
+                trace_id=trace_id,
+                method=method,
+                route=route,
+                request_sent=request_sent,
             ) from None
 
     async def next_message_sequence(self, group_id: str, reply_id: str) -> int:

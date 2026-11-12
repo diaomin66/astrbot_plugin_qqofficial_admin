@@ -16,6 +16,39 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from urllib.parse import quote
 
+from .diagnostics import (
+    DIAGNOSTIC_FIELDS,
+    DIAGNOSTIC_REASONS,
+    DIAGNOSTIC_VALUES,
+    HTTP_METHODS,
+    allowed,
+    current_request_state,
+    json_type,
+    route_template,
+    safe_route,
+    safe_status,
+    safe_trace_id,
+)
+
+
+class QQResponse(dict[str, Any]):
+    """Business data with safe HTTP metadata kept outside the JSON object."""
+
+    def __init__(
+        self,
+        data: Mapping[str, Any] | None = None,
+        *,
+        status: int = 0,
+        trace_id: str = "",
+        method: str = "",
+        route: str = "",
+    ) -> None:
+        super().__init__(data if data is not None else {})
+        self.status = safe_status(status)
+        self.trace_id = safe_trace_id(trace_id)
+        self.method = allowed(method, HTTP_METHODS)
+        self.route = safe_route(route)
+
 
 class QQAPIError(RuntimeError):
     """An API failure whose display text never includes an upstream credential."""
@@ -26,24 +59,78 @@ class QQAPIError(RuntimeError):
         code: int | str | None,
         message: str,
         trace_id: str = "",
+        *,
+        method: str = "",
+        route: str = "",
+        reason: str = "",
+        field: str = "",
+        expected: str = "",
+        actual: str = "",
+        request_sent: bool | None = None,
     ) -> None:
-        self.status = status
+        self.status = safe_status(status)
         self.code = code
         self.message = message
-        self.trace_id = trace_id
+        self.trace_id = safe_trace_id(trace_id)
+        self.method = allowed(method, HTTP_METHODS)
+        self.route = safe_route(route)
+        self.reason = allowed(reason, DIAGNOSTIC_REASONS)
+        self.field = allowed(field, DIAGNOSTIC_FIELDS)
+        self.expected = allowed(expected, DIAGNOSTIC_VALUES)
+        self.actual = allowed(actual, DIAGNOSTIC_VALUES)
+        self.request_sent = request_sent if type(request_sent) is bool else None
         # Raw API messages can echo request data; do not put them in exceptions
         # that third-party loggers may print without redaction.
         super().__init__(self.user_message())
+
+    def with_request_context(
+        self, *, method: str, route: str, request_sent: bool | None
+    ) -> QQAPIError:
+        """Rebuild the exception so its args and display diagnostics stay equal."""
+        return QQAPIError(
+            self.status,
+            self.code,
+            self.message,
+            self.trace_id,
+            method=method,
+            route=route,
+            reason=self.reason,
+            field=self.field,
+            expected=self.expected,
+            actual=self.actual,
+            request_sent=request_sent,
+        )
+
+    def diagnostic_text(self) -> str:
+        details = []
+        if self.method:
+            details.append(self.method)
+        if self.route:
+            details.append(self.route)
+        if self.status:
+            details.append(f"HTTP={self.status}")
+        code = str(self.code or "")
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", code):
+            details.append(f"错误码 {code}")
+        if self.trace_id:
+            details.append(f"TraceID {self.trace_id}")
+        for label in ("reason", "field", "expected", "actual"):
+            value = getattr(self, label)
+            if value:
+                details.append(f"{label}={value}")
+        if self.request_sent is not None:
+            details.append(f"request_sent={'true' if self.request_sent else 'false'}")
+        return " ".join(details)
 
     def user_message(self) -> str:
         code = str(self.code or "")
         reasons = {
             "AUTH_UNAVAILABLE": "QQ 官方机器人尚未登录或令牌刷新失败，请检查连接状态。",
             "TRANSPORT_CLOSED": "插件正在关闭，请稍后重试。",
-            "TIMEOUT": "QQ 接口连接超时，操作结果尚未确认，请先查询状态后再决定是否重试。",
-            "NETWORK_ERROR": "QQ 接口连接失败，操作结果尚未确认，请先查询状态后再决定是否重试。",
+            "TIMEOUT": "QQ 接口请求超时。",
+            "NETWORK_ERROR": "QQ 接口连接失败。",
             "REPLY_EXPIRED": "被动回复已超过 5 分钟，请重新发起操作。",
-            "INVALID_RESPONSE": "QQ 接口返回异常，操作结果尚未确认，请先查询状态。",
+            "INVALID_RESPONSE": "QQ 接口返回的响应无法通过校验。",
             "11253": "该机器人尚未获准调用此接口，请向 QQ 开放平台申请白名单或内邀权限。",
             "11254": "该机器人的接口权限已被平台封禁。",
             "11282": "机器人缺少所需管理员权限，请在 QQ 群内授予机器人管理员身份。",
@@ -81,12 +168,8 @@ class QQAPIError(RuntimeError):
             reason = "无法连接 QQ 平台，请检查网络后重试。"
         else:
             reason = "QQ 平台未完成该操作，请检查参数及机器人权限。"
-        details = []
-        if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", code):
-            details.append(f"错误码 {code}")
-        if self.trace_id and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.trace_id):
-            details.append(f"TraceID {self.trace_id}")
-        return reason + ("（" + "；".join(details) + "）" if details else "")
+        diagnostic = self.diagnostic_text()
+        return reason + ("\n诊断：" + diagnostic if diagnostic else "")
 
 
 class QQTransport(Protocol):
@@ -260,9 +343,37 @@ class QQGroupAPI:
         *,
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        response = await self.transport.request(method, path, json=json, params=params)
-        return response if response is not None else {}
+    ) -> QQResponse:
+        state = current_request_state.get()
+        if (
+            method != "GET"
+            and getattr(self.transport, "tracks_mutations", False) is not True
+            and state is not None
+        ):
+            state.mutation_started = True
+        try:
+            response = await self.transport.request(method, path, json=json, params=params)
+        except QQAPIError as exc:
+            raise exc.with_request_context(
+                method=exc.method or method,
+                route=exc.route or route_template(path),
+                request_sent=exc.request_sent,
+            ) from None
+        if isinstance(response, QQResponse):
+            return response
+        if response is not None and not isinstance(response, dict):
+            raise QQAPIError(
+                0,
+                "INVALID_RESPONSE",
+                "QQ 接口返回的数据结构不符合预期",
+                method=method,
+                route=route_template(path),
+                reason="root_type",
+                expected="object",
+                actual=json_type(response),
+                request_sent=True,
+            )
+        return QQResponse(response, method=method, route=route_template(path))
 
     async def get_group_info(self, group_openid: str) -> dict[str, Any]:
         return await self._request("GET", self._group(group_openid) + "/info")
