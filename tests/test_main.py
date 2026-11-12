@@ -25,7 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from qq_admin.api import QQAPIError
-from qq_admin.panels import ButtonSpec, Panel
+from qq_admin.panels import ButtonSpec, MemberMention, Panel, text_reply
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "_qqadmin_entrypoint_contract"
@@ -233,6 +233,8 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"禁言", "解禁", "移出", "帮助", "确认", "群管"} <= record[2]["alias"])
         self.assertIn("qqadmin", record[2]["alias"])
         self.assertNotIn("help", record[2]["alias"])
+        self.assertTrue({"设置菜单", "菜单状态", "移除菜单"}.isdisjoint(record[2]["alias"]))
+        self.assertNotIn("设置菜单", command.__doc__)
         self.assertEqual(record[2]["priority"], 100)
         callback = self.handler("button_action")
         record = next(item for item in callback._contract_filters if item[0] == "button_action")
@@ -249,7 +251,7 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args[1], "信息")
         self.assertEqual(self.sender.await_count, 2)
 
-    async def test_api_error_reply_and_log_identify_command_without_arguments_or_upstream_body(
+    async def test_api_error_reply_is_brief_while_log_keeps_safe_diagnostics(
         self,
     ):
         self.plugin._manager.handle.side_effect = QQAPIError(
@@ -280,19 +282,44 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("member-1", shown)
         self.assertNotIn("group-1", shown)
         self.assertTrue(panel.prefer_plain_text)
+        self.assertEqual(panel.title, "")
+        self.assertEqual(panel.buttons, [])
         self.sender.assert_awaited_once()
         payload = self.sender.await_args.args[1]
         self.assertEqual(payload["msg_type"], 0)
         self.assertNotIn("markdown", payload)
         self.assertNotIn("keyboard", payload)
-        self.assertIn("INVALID_RESPONSE", payload["content"])
-        self.assertIn("reason=root_type", payload["content"])
-        self.assertIn("request_sent=true", payload["content"])
+        self.assertEqual(
+            payload["content"], self.plugin._manager.handle.side_effect.concise_message()
+        )
+        self.assertNotIn("INVALID_RESPONSE", payload["content"])
+        self.assertNotIn("root_type", payload["content"])
+        self.assertNotIn("trace-abc", payload["content"])
+        self.assertNotIn("\n", payload["content"])
         self.assertNotIn("\\", payload["content"])
+
+    async def test_validation_error_has_no_title_and_cannot_inject_a_qq_tag(self):
+        self.plugin._manager.handle.side_effect = ValueError("参数错误 <qqbot-at-everyone />")
+        await self.handler("command")(FakeEvent())
+        self.assertEqual(
+            self.sender.await_args.args[1],
+            {"msg_type": 0, "content": "参数错误 ＜qqbot-at-everyone /＞"},
+        )
+
+    async def test_unexpected_error_reply_does_not_expose_exception_details(self):
+        self.plugin._manager.handle.side_effect = RuntimeError("private request body")
+        with self.assertLogs("qqadmin.entrypoint.test", level="ERROR") as logs:
+            await self.handler("command")(FakeEvent())
+        self.assertEqual(
+            self.sender.await_args.args[1],
+            {"msg_type": 0, "content": "结果未确认，请先查询状态。"},
+        )
+        self.assertIn("RuntimeError", "\n".join(logs.output))
+        self.assertNotIn("private request body", "\n".join(logs.output))
 
     async def test_preferred_plain_diagnostics_preserve_identifiers_and_neutralize_qq_tags(self):
         diagnostic = (
-            "INVALID_RESPONSE reason=field_type field=records[].panel "
+            "INVALID_RESPONSE reason=field_type field=members "
             "expected=object actual=null request_sent=true"
         )
         panel = Panel(
@@ -390,9 +417,20 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.plugin, "_deliver", wraps=self.plugin._deliver) as deliver:
             await self.handler("command")(event)
             panel = deliver.await_args.args[1]
-            self.assertEqual(panel.title, "操作已完成")
-            self.assertIn("600 秒", panel.body)
+            self.assertEqual(panel.title, "")
+            self.assertEqual(panel.body, "已禁言 @member-a @member-b 10分钟")
+            self.assertEqual(panel.buttons, [])
             self.assertNotIn("robot-member", panel.body)
+            self.assertEqual(
+                self.sender.await_args.args[1],
+                {
+                    "msg_type": 2,
+                    "markdown": {
+                        "content": '已禁言 <qqbot-at-user id="member-a" /> '
+                        '<qqbot-at-user id="member-b" /> 10分钟'
+                    },
+                },
+            )
             transport.request.assert_awaited_once()
             request = transport.request.await_args
             self.assertEqual(request.args, ("POST", "/v2/groups/group-1/restrict_chat_setting"))
@@ -418,9 +456,13 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
             event.message_obj.raw_message.event_id = f"INTERACTION_CREATE:{index}"
             with patch.object(self.plugin, "_deliver", wraps=self.plugin._deliver) as deliver:
                 await self.handler("button_action")(event)
-                self.assertEqual(
-                    deliver.await_args.args[1].title, "操作已完成" if index == 0 else "未执行操作"
-                )
+                self.assertEqual(deliver.await_args.args[1].title, "")
+                if index == 0:
+                    self.assertEqual(
+                        deliver.await_args.args[1].body, "已禁言 @target-member 10分钟"
+                    )
+                else:
+                    self.assertNotIn("已禁言", deliver.await_args.args[1].body)
             transport.request.assert_awaited_once()
         self.assertEqual(
             transport.request.await_args.kwargs["json"]["members"][0]["member_openid"],
@@ -438,68 +480,106 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         await self.handler("command")(event)
         self.plugin._manager.handle.assert_not_awaited()
 
-    async def test_setup_menu_command_creates_native_group_panel_without_confirmation(self):
+    async def test_removed_official_menu_commands_never_call_qq_panels(self):
         manager = self.plugin._manager
         manager.handle = type(manager).handle.__get__(manager)
-        transport = SimpleNamespace(
-            request=AsyncMock(
-                side_effect=[
-                    {"records": [], "next_cursor": "", "is_end": True},
-                    {"panel_id": "native-panel-1"},
-                ]
-            )
-        )
+        transport = SimpleNamespace(request=AsyncMock())
         self.plugin._transport = AsyncMock(return_value=transport)
-        event = FakeEvent("/设置菜单")
-        await self.handler("command")(event)
-        self.assertEqual(transport.request.await_count, 2)
+        for command in ("设置菜单", "菜单状态", "移除菜单"):
+            with self.subTest(command=command):
+                await self.handler("command")(FakeEvent("/群管 " + command))
+                transport.request.assert_not_awaited()
+                self.assertEqual(self.sender.await_args.args[1]["msg_type"], 0)
 
-        listed, created = transport.request.await_args_list
-        self.assertEqual(listed.args, ("GET", "/v2/panels"))
-        self.assertEqual(listed.kwargs["params"]["scope"], "group")
-        self.assertEqual(created.args, ("POST", "/v2/panels"))
-        body = created.kwargs["json"]
-        self.assertEqual(body["group_openids"], ["group-1"])
-        self.assertEqual(body["target_type"], "specific")
-        self.assertEqual(len(body["panel"]["items"]), 20)
-        self.assertIn("/禁言", [item["name"] for item in body["panel"]["items"]])
-        await self.handler("command")(event)
-        self.assertEqual(transport.request.await_count, 2)
-
-    async def test_setup_menu_with_omitted_empty_records_executes_once_without_confirmation(self):
+    async def test_message_menu_and_short_help_make_no_panel_management_requests(self):
         manager = self.plugin._manager
         manager.handle = type(manager).handle.__get__(manager)
-        transport = SimpleNamespace(
-            request=AsyncMock(side_effect=[{"is_end": True}, {"panel_id": "native-panel-1"}])
-        )
+        transport = SimpleNamespace(request=AsyncMock())
         self.plugin._transport = AsyncMock(return_value=transport)
-        event = FakeEvent("/设置菜单")
-        with patch.object(self.plugin, "_deliver", wraps=self.plugin._deliver) as deliver:
-            await self.handler("command")(event)
-        self.assertEqual(deliver.await_args.args[1].title, "操作已完成")
-        self.assertEqual(
-            [call.args for call in transport.request.await_args_list],
-            [("GET", "/v2/panels"), ("POST", "/v2/panels")],
-        )
-        await self.handler("command")(event)
-        self.assertEqual(transport.request.await_count, 2)
+        for command in ("菜单", "帮助", "帮助 策略", "帮助 消息"):
+            with self.subTest(command=command):
+                await self.handler("command")(FakeEvent("/" + command))
+                transport.request.assert_not_awaited()
+                payload = self.sender.await_args.args[1]
+                self.assertEqual(payload["msg_type"], 2)
+                self.assertIn("keyboard", payload)
+                for removed in ("设置菜单", "菜单状态", "移除菜单"):
+                    self.assertNotIn(removed, payload["markdown"]["content"])
 
-    async def test_setup_menu_unknown_list_shape_sends_plain_diagnostic_and_never_writes(self):
+    async def test_member_success_reply_uses_markdown_even_with_plain_panel_preference(self):
         manager = self.plugin._manager
         manager.handle = type(manager).handle.__get__(manager)
-        transport = SimpleNamespace(request=AsyncMock(return_value={"data": {"records": []}}))
+        transport = SimpleNamespace(request=AsyncMock(return_value={}))
         self.plugin._transport = AsyncMock(return_value=transport)
-        await self.handler("command")(FakeEvent("/设置菜单"))
+        for index, use_markdown in enumerate((True, False)):
+            with self.subTest(use_markdown=use_markdown):
+                self.config["use_markdown"] = use_markdown
+                event = FakeEvent("/禁言 target-member")
+                event.message_obj.raw_message.id = f"message-{index}"
+                await self.handler("command")(event)
+                self.assertEqual(
+                    self.sender.await_args.args[1],
+                    {
+                        "msg_type": 2,
+                        "markdown": {
+                            "content": '已禁言 <qqbot-at-user id="target-member" /> 10分钟'
+                        },
+                    },
+                )
+                self.assertEqual(transport.request.await_count, index + 1)
+
+    async def test_member_success_markdown_rejection_falls_back_once_without_repeating_write(self):
+        manager = self.plugin._manager
+        manager.handle = type(manager).handle.__get__(manager)
+        transport = SimpleNamespace(request=AsyncMock(return_value={}))
+        self.plugin._transport = AsyncMock(return_value=transport)
+        self.sender.side_effect = [QQAPIError(403, 304036, "private reason"), {"id": "fallback"}]
+        await self.handler("command")(FakeEvent("/禁言 target-member"))
         transport.request.assert_awaited_once()
-        self.assertEqual(transport.request.await_args.args, ("GET", "/v2/panels"))
+        self.assertEqual(self.sender.await_count, 2)
+        first, second = self.sender.await_args_list
+        self.assertEqual(first.args[1]["msg_type"], 2)
+        self.assertIn('<qqbot-at-user id="target-member" />', first.args[1]["markdown"]["content"])
+        self.assertEqual(second.args[1], {"msg_type": 0, "content": "已禁言 @target-member 10分钟"})
+
+    async def test_member_reply_timeout_does_not_resend_or_repeat_mutation(self):
+        manager = self.plugin._manager
+        manager.handle = type(manager).handle.__get__(manager)
+        transport = SimpleNamespace(request=AsyncMock(return_value={}))
+        self.plugin._transport = AsyncMock(return_value=transport)
+        self.sender.side_effect = QQAPIError(0, "TIMEOUT", "private reason")
+        with self.assertLogs("qqadmin.entrypoint.test", level="WARNING"):
+            await self.handler("command")(FakeEvent("/禁言 target-member"))
+        transport.request.assert_awaited_once()
+        self.sender.assert_awaited_once()
+
+    async def test_failed_mutation_has_one_short_reply_and_is_not_reexecuted(self):
+        manager = self.plugin._manager
+        manager.handle = type(manager).handle.__get__(manager)
+        transport = SimpleNamespace(
+            request=AsyncMock(side_effect=QQAPIError(0, "TIMEOUT", "private"))
+        )
+        self.plugin._transport = AsyncMock(return_value=transport)
+        event = FakeEvent("/禁言 target-member")
+        await self.handler("command")(event)
+        transport.request.assert_awaited_once()
+        self.assertEqual(
+            self.sender.await_args.args[1], {"msg_type": 0, "content": "结果未确认，请先查询状态。"}
+        )
+        await self.handler("command")(event)
+        transport.request.assert_awaited_once()
+
+    async def test_only_structured_member_reply_segments_can_generate_mentions(self):
+        self.plugin._manager.handle.return_value = text_reply(
+            '已处理 <qqbot-at-everyone /> <qqbot-cmd-enter text="/移出" /> ',
+            MemberMention("real-target"),
+        )
+        await self.handler("command")(FakeEvent())
         payload = self.sender.await_args.args[1]
-        self.assertEqual(payload["msg_type"], 0)
-        self.assertIn("未发送修改请求", payload["content"])
-        self.assertIn("INVALID_RESPONSE", payload["content"])
-        self.assertIn("field=records", payload["content"])
-        self.assertIn("actual=missing", payload["content"])
-        self.assertIn("response_shape=object{data:object,data.records:array}", payload["content"])
-        self.assertNotIn("\\", payload["content"])
+        content = payload["markdown"]["content"]
+        self.assertEqual(content.count("<qqbot-"), 1)
+        self.assertIn('<qqbot-at-user id="real-target" />', content)
+        self.assertIn("&lt;qqbot", content)
 
     async def test_command_and_callback_ignore_non_qq_groups_and_guild_channels(self):
         for kind in ("command", "button_action"):

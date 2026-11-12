@@ -1,10 +1,13 @@
 """所有入口共用的服务端鉴权，不信任按钮客户端 permission。"""
 
+import logging
 import re
 from collections.abc import Mapping
 from typing import Any
 
 from .api import QQAPIError
+
+logger = logging.getLogger(__name__)
 
 
 class PermissionDenied(ValueError):
@@ -33,10 +36,9 @@ class AccessControl:
             try:
                 member = await api.get_member(ctx.group_id, ctx.user_id)
             except QQAPIError as exc:
+                logger.warning("QQ administrator verification failed: %s", exc.user_message())
                 raise PermissionDenied(
-                    "无法验证你的群管理员身份，未执行操作。"
-                    "成员信息接口可能尚未获得官方白名单；可由 AstrBot 管理员配置本群的受信任管理员。\n"
-                    + exc.user_message()
+                    "无法验证管理员身份，请联系 AstrBot 管理员配置权限。"
                 ) from exc
             if member.get("member_role") in {"owner", "admin"} and not member.get("bot", False):
                 return

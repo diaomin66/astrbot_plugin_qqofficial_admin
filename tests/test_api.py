@@ -106,21 +106,21 @@ class APIContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_response_metadata_is_preserved_and_legacy_empty_results_are_wrapped(self):
         response = QQResponse(
-            {"panel_id": "p"},
+            {"strategy_id": "s"},
             status=201,
             trace_id="trace-create",
             method="POST",
-            route="/v2/panels",
+            route="/v2/groups/join_approval_strategy",
         )
         self.transport.response = response
-        self.assertIs(await self.api._request("POST", "/v2/panels"), response)
+        self.assertIs(await self.api.create_strategy(group_openids=["g"]), response)
         self.transport.response = None
-        empty = await self.api.delete_panel("p")
+        empty = await self.api.delete_strategy("s")
         self.assertIsInstance(empty, QQResponse)
         self.assertEqual(empty, {})
         self.assertEqual(empty.status, 0)
         self.assertEqual(empty.method, "DELETE")
-        self.assertEqual(empty.route, "/v2/panels/{panel_id}")
+        self.assertEqual(empty.route, "/v2/groups/join_approval_strategy/{strategy_id}")
 
     async def test_compatible_transport_non_object_response_has_safe_type_diagnostics(self):
         self.transport.response = ["private response text"]
@@ -381,122 +381,6 @@ class APIContractTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.api.get_group_info(group)
 
-    async def test_group_native_panel_endpoints_and_response_fields(self):
-        panel = {
-            "items": [
-                {
-                    "type": "command",
-                    "name": "/群管 信息",
-                    "desc": "查看本群信息",
-                    "only_admin": True,
-                },
-                {"type": "link", "name": "帮助", "link": "https://example.com/help"},
-            ],
-            "remark": "qqofficial_admin.command_menu.v1",
-        }
-        self.transport.response = {"records": [], "next_cursor": "opaque+/=", "is_end": False}
-        result = await self.api.list_panels(cursor="current+/=", limit=50)
-        self.assertEqual(result["next_cursor"], "opaque+/=")
-        self.assertEqual(
-            self.transport.calls[-1],
-            ("GET", "/v2/panels", None, {"scope": "group", "cursor": "current+/=", "limit": 50}),
-        )
-        self.transport.response = {"panel_id": "p-owned"}
-        self.assertEqual((await self.api.create_panel(["group-a"], panel))["panel_id"], "p-owned")
-        self.assertEqual(
-            self.transport.calls[-1],
-            (
-                "POST",
-                "/v2/panels",
-                {
-                    "scope": "group",
-                    "target_type": "specific",
-                    "group_openids": ["group-a"],
-                    "panel": panel,
-                },
-                None,
-            ),
-        )
-        self.transport.response = {
-            "panel_id": "p-owned",
-            "scope": "group",
-            "target_type": "specific",
-            "panel": panel,
-            "group_openids": ["group-a"],
-            "version": 2,
-        }
-        self.assertEqual((await self.api.get_panel("p-owned"))["group_openids"], ["group-a"])
-        self.assertEqual(self.transport.calls[-1], ("GET", "/v2/panels/p-owned", None, None))
-        self.transport.response = {"version": 3}
-        self.assertEqual((await self.api.update_panel("p-owned", panel))["version"], 3)
-        self.assertEqual(
-            self.transport.calls[-1], ("PUT", "/v2/panels/p-owned", {"panel": panel}, None)
-        )
-        self.transport.response = None
-        self.assertEqual(await self.api.update_panel_groups("p-owned", "add", ["group-b"]), {})
-        self.assertEqual(
-            self.transport.calls[-1],
-            ("PUT", "/v2/panels/p-owned/target", {"op": "add", "group_openids": ["group-b"]}, None),
-        )
-        self.assertEqual(await self.api.delete_panel("p-owned"), {})
-        self.assertEqual(self.transport.calls[-1], ("DELETE", "/v2/panels/p-owned", None, None))
-
-    async def test_panel_command_uses_name_and_rejects_undocumented_template_fields(self):
-        command = {
-            "type": "command",
-            "name": "/群管 取消拉黑",
-            "desc": "补充成员 OpenID",
-            "only_admin": True,
-        }
-        panel = {"items": [command], "remark": "owner-marker", "version": 1}
-        await self.api.create_panel(["g"], panel)
-        sent = self.transport.calls[-1][2]
-        self.assertEqual(sent["panel"]["items"][0]["name"], "/群管 取消拉黑")
-        command["name"] = "changed"
-        self.assertEqual(sent["panel"]["items"][0]["name"], "/群管 取消拉黑")
-        for item in (
-            {"type": "command", "name": "/群管 信息", "data": "separate command"},
-            {"type": "command", "name": "/群管 信息", "enter": True},
-            {"type": "command", "name": "/群管 信息", "params": ["member"]},
-            {"type": "command", "name": "/群管 策略白名单"},
-            {"type": "command", "name": "查询", "desc": "字" * 16},
-            {"type": "command", "name": "查询", "only_admin": "true"},
-            {"type": "command", "name": "查询", "link": "https://example.com"},
-            {"type": "link", "name": "帮助", "link": "http://example.com"},
-            {"type": "link", "name": "帮助", "link": "https://"},
-            {"type": "link", "name": "帮助"},
-            {"type": "callback", "name": "操作"},
-        ):
-            with self.subTest(item=item), self.assertRaises(ValueError):
-                await self.api.update_panel("p", {"items": [item]})
-        self.assertEqual(len(self.transport.calls), 1)
-
-    async def test_panel_limits_targets_and_ids_are_checked_before_sending(self):
-        panel = {"items": [{"type": "command", "name": "/群管 信息"}]}
-        await self.api.create_panel([f"g{i}" for i in range(20)], {"items": panel["items"] * 20})
-        await self.api.update_panel_groups("p/../?#", "del", ["g"])
-        self.assertEqual(self.transport.calls[-1][1], "/v2/panels/p%2F..%2F%3F%23/target")
-        for call in (
-            lambda: self.api.list_panels(limit=51),
-            lambda: self.api.list_panels(limit=True),
-            lambda: self.api.create_panel([], panel),
-            lambda: self.api.create_panel(["g", "g"], panel),
-            lambda: self.api.create_panel("g", panel),
-            lambda: self.api.create_panel([f"g{i}" for i in range(21)], panel),
-            lambda: self.api.create_panel(["g"], {"items": []}),
-            lambda: self.api.create_panel(["g"], {"items": panel["items"] * 21}),
-            lambda: self.api.create_panel(["g"], {**panel, "remark": "x" * 256}),
-            lambda: self.api.create_panel(["g"], {**panel, "version": True}),
-            lambda: self.api.create_panel(["g"], {**panel, "target_type": "all"}),
-            lambda: self.api.update_panel_groups("p", "remove", ["g"]),
-            lambda: self.api.update_panel_groups("p", "add", [f"g{i}" for i in range(21)]),
-            lambda: self.api.get_panel(".."),
-            lambda: self.api.delete_panel("bad\nheader"),
-        ):
-            with self.assertRaises(ValueError):
-                await call()
-        self.assertEqual(len(self.transport.calls), 2)
-
     async def test_markdown_buttons_and_at_everyone_preserve_official_payload(self):
         payload = {
             "msg_type": 2,
@@ -558,6 +442,50 @@ class APIContractTests(unittest.IsolatedAsyncioTestCase):
             ).user_message(),
         )
 
+    def test_concise_error_replies_keep_reason_and_leave_diagnostics_to_logs(self):
+        for status, code, phrase in (
+            (403, 11253, "白名单"),
+            (403, 11282, "管理员"),
+            (200, "INVALID_RESPONSE", "校验"),
+            (0, "TIMEOUT", "超时"),
+            (429, None, "频繁"),
+            (503, None, "暂时"),
+        ):
+            error = QQAPIError(
+                status,
+                code,
+                "private upstream body",
+                "trace-secret",
+                method="GET",
+                route="/v2/groups/{group_openid}/members",
+                reason="field_type",
+                field="members",
+                expected="list",
+                actual="missing",
+                request_sent=True,
+                response={"members": None},
+            )
+            with self.subTest(status=status, code=code):
+                reply = error.concise_message()
+                self.assertIn(phrase, reply)
+                self.assertEqual(reply, error.user_message().split("\n", 1)[0])
+                self.assertNotIn("\n", reply)
+                for diagnostic in (
+                    "private",
+                    "trace-secret",
+                    "/v2/",
+                    "field=",
+                    "expected=",
+                    "actual=",
+                    "request_sent",
+                    "response_shape",
+                    "错误码",
+                    "INVALID_RESPONSE",
+                ):
+                    self.assertNotIn(diagnostic, reply)
+                self.assertIn("trace-secret", error.diagnostic_text())
+                self.assertIn("field=members", error.diagnostic_text())
+
 
 class DiagnosticTests(unittest.TestCase):
     def test_response_shape_distinguishes_empty_envelope_and_pagination_structures(self):
@@ -569,20 +497,21 @@ class DiagnosticTests(unittest.TestCase):
                 "object{code:number,message:string}",
             ),
             (
-                {"is_end": True, "next_cursor": ""},
-                "object{is_end:boolean(true),next_cursor:string(empty)}",
+                {"members": [], "next_cursor": ""},
+                "object{members:array,next_cursor:string(empty)}",
             ),
             (
-                {"is_end": False, "next_cursor": "private-cursor"},
-                "object{is_end:boolean(false),next_cursor:string(nonempty)}",
+                {"members": [], "next_cursor": "private-cursor"},
+                "object{members:array,next_cursor:string(nonempty)}",
             ),
             (
-                {"data": {"records": [], "is_end": True, "next_cursor": ""}, "code": 0},
-                "object{data:object,code:number,data.records:array,"
-                "data.is_end:boolean(true),data.next_cursor:string(empty)}",
+                {"data": {"members": [], "next_cursor": ""}, "code": 0},
+                "object{data:object,code:number,data.members:array,data.next_cursor:string(empty)}",
             ),
-            ({"records": None}, "object{records:null}"),
-            ({"records": []}, "object{records:array}"),
+            ({"members": None}, "object{members:null}"),
+            ({"members": []}, "object{members:array}"),
+            ({"bot": True}, "object{bot:boolean}"),
+            ({"bot": False}, "object{bot:boolean}"),
         )
         for response, expected in cases:
             with self.subTest(response=response):
@@ -593,18 +522,18 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_response_shape_never_exposes_unknown_keys_values_or_nested_payloads(self):
         response = {
-            "records": [{"private-array-key": "private-token"}],
+            "members": [{"private-array-key": "private-token"}],
             "code": "private-code",
             "message": "private notice content",
             "trace_id": "private-trace",
-            "is_end": "private-invalid-boolean",
+            "bot": "private-invalid-boolean",
             "next_cursor": "private-cursor",
-            "panel": {"items": "private-inner-value", "private-panel-key": "private-token"},
+            "global_rule": {"mode": "private-inner-value", "private-rule-key": "private-token"},
             "private-root-key": "private-token",
-            "records.private-path": "private-value",
+            "members.private-path": "private-value",
             "data": {
-                "records": ["private-nested-list"],
-                "is_end": 1,
+                "members": ["private-nested-list"],
+                "bot": 1,
                 "next_cursor": ["private-invalid-cursor"],
                 "data": {"message": "private-deep-message", "private-deep-key": "private-value"},
                 "private-nested-key": "private-value",
@@ -614,28 +543,30 @@ class DiagnosticTests(unittest.TestCase):
         summary = error.response_shape
         self.assertIn("unknown_keys:2", summary)
         self.assertIn("data.unknown_keys:1", summary)
-        self.assertIn("is_end:string", summary)
-        self.assertIn("data.is_end:number", summary)
+        self.assertIn("bot:string", summary)
+        self.assertIn("data.bot:number", summary)
         self.assertIn("data.next_cursor:array", summary)
         self.assertIn("data.data:object", summary)
         self.assertNotIn("data.data.message", summary)
-        self.assertNotIn("panel.items", summary)
+        self.assertNotIn("global_rule.mode", summary)
         self.assertNotIn("private", summary)
         self.assertNotIn("private", error.user_message())
         self.assertNotIn("private", repr(error))
 
     def test_response_shape_is_a_snapshot_preserved_by_request_context_enrichment(self):
-        response = {"data": {"records": [], "next_cursor": "private-cursor"}, "is_end": True}
+        response = {"data": {"members": [], "next_cursor": "private-cursor"}, "bot": True}
         error = QQAPIError(200, "INVALID_RESPONSE", "ignored", response=response)
         original = error.response_shape
-        response["is_end"] = False
+        response["bot"] = False
         response["data"].clear()
         response["private-new-key"] = "private-new-value"
-        rebuilt = error.with_request_context(method="GET", route="/v2/panels", request_sent=True)
+        rebuilt = error.with_request_context(
+            method="GET", route="/v2/groups/{group_openid}/members", request_sent=True
+        )
         self.assertEqual(error.response_shape, original)
         self.assertEqual(rebuilt.response_shape, original)
         self.assertEqual(str(rebuilt), rebuilt.user_message())
-        self.assertIn("GET /v2/panels", str(rebuilt))
+        self.assertIn("GET /v2/groups/{group_openid}/members", str(rebuilt))
         self.assertNotIn("private", repr(rebuilt))
         self.assertNotIn("private", repr(rebuilt.__dict__))
         with self.assertRaises(AttributeError):
@@ -662,13 +593,12 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_response_shape_covers_only_fixed_fields_and_stops_at_field_boundaries(self):
         fields = (
-            "records",
-            "is_end",
+            "members",
             "next_cursor",
             "data",
             "list",
-            "panels",
-            "items",
+            "users",
+            "strategies",
             "code",
             "err_code",
             "retcode",
@@ -678,12 +608,17 @@ class DiagnosticTests(unittest.TestCase):
             "trace_id",
             "total",
             "count",
-            "panel_id",
-            "version",
-            "scope",
-            "target_type",
-            "panel",
+            "member_openid",
+            "member_role",
+            "bot",
             "group_openids",
+            "strategy_id",
+            "is_enable",
+            "expire_at",
+            "global_rule",
+            "remove_members_result",
+            "add_to_member_blacklist_fail_openids",
+            "fail_openids",
         )
         for field in fields:
             with self.subTest(field=field):
@@ -719,7 +654,9 @@ class DiagnosticTests(unittest.TestCase):
                     field=field,
                     expected="integer_or_string_or_null",
                     actual="object",
-                ).with_request_context(method="GET", route="/v2/panels", request_sent=True)
+                ).with_request_context(
+                    method="GET", route="/v2/groups/{group_openid}/members", request_sent=True
+                )
                 self.assertEqual(error.field, field)
                 self.assertEqual(error.expected, "integer_or_string_or_null")
                 self.assertEqual(error.actual, "object")
@@ -760,9 +697,6 @@ class DiagnosticTests(unittest.TestCase):
             "/v2/groups/join_approval_strategy/private-strategy/whitelist_users": (
                 "/v2/groups/join_approval_strategy/{strategy_id}/whitelist_users"
             ),
-            "/v2/panels": "/v2/panels",
-            "/v2/panels/private-panel": "/v2/panels/{panel_id}",
-            "/v2/panels/private-panel/target": "/v2/panels/{panel_id}/target",
             "/v2/groups/private-group/messages": "/v2/groups/{group_openid}/messages",
             "/v2/groups/private-group/messages/private-message": (
                 "/v2/groups/{group_openid}/messages/{message_id}"
@@ -774,10 +708,10 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertNotIn("private", route_template(path))
         for path in (
             "/private-unknown-route",
-            "/v2/panels?cursor=private",
-            "/v2/panels/private\n",
-            "/v2/panels/private/unknown",
-            "https://api.bot.qq.com/v2/panels",
+            "/v2/groups/private-group/members?cursor=private",
+            "/v2/groups/private-group/members/private\n",
+            "/v2/groups/private-group/members/private/unknown",
+            "https://api.bot.qq.com/v2/groups/private-group/members",
         ):
             with self.subTest(path=path):
                 self.assertEqual(route_template(path), "unknown")
@@ -789,21 +723,21 @@ class DiagnosticTests(unittest.TestCase):
             "private notification body and credential",
             trace_id="trace_123",
             method="GET",
-            route="/v2/panels",
+            route="/v2/groups/{group_openid}/members",
             reason="field_type",
-            field="records[].panel",
-            expected="object",
+            field="members[].member_openid",
+            expected="string",
             actual="null",
             request_sent=True,
         )
         for expected in (
-            "GET /v2/panels",
+            "GET /v2/groups/{group_openid}/members",
             "HTTP=200",
             "INVALID_RESPONSE",
             "trace_123",
             "reason=field_type",
-            "field=records[].panel",
-            "expected=object",
+            "field=members[].member_openid",
+            "expected=string",
             "actual=null",
             "request_sent=true",
         ):
@@ -821,9 +755,9 @@ class DiagnosticTests(unittest.TestCase):
             "private-body",
             trace_id="private\ntrace",
             method="POST private-data",
-            route="/v2/panels/private-panel",
+            route="/v2/groups/private-group/members/private-member",
             reason="private-reason",
-            field="records.private-key",
+            field="members.private-key",
             expected="private-expectation",
             actual="private-value",
             request_sent="private-value",
@@ -837,13 +771,13 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_response_metadata_does_not_change_business_json(self):
         result = QQResponse(
-            {"records": []},
+            {"members": []},
             status=200,
             trace_id="trace-1",
             method="GET",
-            route="/v2/panels",
+            route="/v2/groups/{group_openid}/members",
         )
-        self.assertEqual(json.loads(json.dumps(result)), {"records": []})
+        self.assertEqual(json.loads(json.dumps(result)), {"members": []})
         self.assertEqual(result.status, 200)
         self.assertEqual(result.trace_id, "trace-1")
         result = QQResponse({}, status=True, trace_id="invalid trace", route="/private-id")

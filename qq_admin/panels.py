@@ -39,6 +39,18 @@ class ButtonSpec:
     danger: bool = False
 
 
+@dataclass(frozen=True)
+class MemberMention:
+    member_openid: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.member_openid, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.member_openid) is None
+        ):
+            raise ValueError("成员 OpenID 无效。")
+
+
 @dataclass
 class Panel:
     title: str
@@ -47,6 +59,47 @@ class Panel:
     # Diagnostic identifiers must remain copyable even in QQ clients that
     # display Markdown escape characters instead of interpreting them.
     prefer_plain_text: bool = False
+    content_parts: tuple[str | MemberMention, ...] = ()
+
+
+def text_reply(*parts: str | MemberMention) -> Panel:
+    """Create a concise reply with explicit mentions, never executable text."""
+    if any(not isinstance(part, str | MemberMention) for part in parts):
+        raise ValueError("回复内容必须是文字或成员提及。")
+    body = "".join(
+        f"@{part.member_openid}" if isinstance(part, MemberMention) else part for part in parts
+    )
+    return Panel("", body, prefer_plain_text=True, content_parts=tuple(parts))
+
+
+def _escape_plain(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL_CHARACTERS.sub("", text).replace("<", "＜").replace(">", "＞")
+
+
+def render_plain_panel(panel: Panel) -> str:
+    """Plain group messages have no member-mention support; show literal IDs."""
+    if panel.content_parts:
+        parts: list[str] = []
+        for part in panel.content_parts:
+            if isinstance(part, MemberMention):
+                parts.append(f"@{part.member_openid}")
+            elif isinstance(part, str):
+                parts.append(_escape_plain(part))
+            else:
+                raise ValueError("回复内容必须是文字或成员提及。")
+        body = "".join(parts)
+    else:
+        body = _escape_plain(panel.body)
+    sections = [_escape_plain(panel.title), body]
+    if panel.buttons:
+        sections.append(
+            "可用命令：\n"
+            + "\n".join(
+                _escape_plain(f"{button.label}：/{button.command}") for button in panel.buttons
+            )
+        )
+    return "\n\n".join(section for section in sections if section)
 
 
 def escape_markdown(value: Any) -> str:
@@ -64,7 +117,19 @@ def escape_markdown(value: Any) -> str:
 
 def _markdown_content(panel: Panel) -> str:
     title = escape_markdown(panel.title).replace("\n", " ")
-    return f"## {title}\n\n{escape_markdown(panel.body)}"
+    if panel.content_parts:
+        parts: list[str] = []
+        for part in panel.content_parts:
+            if isinstance(part, MemberMention):
+                parts.append(f'<qqbot-at-user id="{part.member_openid}" />')
+            elif isinstance(part, str):
+                parts.append(escape_markdown(part))
+            else:
+                raise ValueError("回复内容必须是文字或成员提及。")
+        body = "".join(parts)
+    else:
+        body = escape_markdown(panel.body)
+    return f"## {title}\n\n{body}" if title else body
 
 
 def build_payload(
@@ -78,6 +143,9 @@ def build_payload(
     the panel owner on the QQ client. Context values must additionally be
     compared against the actual event by the server-side handler.
     """
+    member_reply = any(isinstance(part, MemberMention) for part in panel.content_parts)
+    if (panel.content_parts or panel.prefer_plain_text) and not member_reply:
+        return {"msg_type": 0, "content": render_plain_panel(panel)}
     content = _markdown_content(panel)
     if len(content) > MAX_MARKDOWN_LENGTH:
         raise ValueError("菜单内容过长，请拆分显示；操作详情不能被截断")
@@ -146,11 +214,7 @@ def build_payload(
 def home_panel() -> Panel:
     return Panel(
         title="群管理菜单",
-        body=(
-            "点击管理指令，补全 @成员、时长或内容后发送，即可执行。\n"
-            "例如：/禁言 @成员 10m；不填时长默认 10 分钟。请在 QQ 中选择真实成员。\n"
-            "查询按钮直接查看结果。按钮仅供打开菜单的用户操作，管理功能按当前权限执行。"
-        ),
+        body=("选择指令，补全参数后发送。\n禁言示例：/禁言 @成员 10m（默认 10 分钟）"),
         buttons=[
             ButtonSpec("禁言", "禁言 ", "input"),
             ButtonSpec("解禁", "解禁 ", "input"),
@@ -176,55 +240,49 @@ def home_panel() -> Panel:
     )
 
 
-def help_panel() -> Panel:
-    return Panel(
-        title="管理指令帮助",
-        body=(
-            "发送 /菜单 打开消息快捷菜单；点击管理指令，补全参数后发送即执行。\n"
-            "由 AstrBot 管理员发送 /设置菜单 安装 QQ 客户端原生指令面板。\n"
-            "也可直接发送下方短命令，查询与审批按钮点击后直接处理。请在 QQ 中选择真实的 @成员。\n"
-            "若机器人只能接收 @它的消息，请同时 @机器人；机器人自身不会作为操作目标。\n"
-            "成员目标也可填写 /成员 中的 OpenID；多个 OpenID 用逗号分隔。策略白名单使用 QQ 号。\n\n"
-            "查看信息\n"
-            "/菜单｜/帮助｜/身份｜/信息｜/状态\n"
-            "/菜单状态\n"
-            "/成员 [cursor]\n"
-            "/成员详情 @成员\n"
-            "/禁言状态\n"
-            "/黑名单 [cursor]\n"
-            "/入群 [cursor]\n"
-            "/最近消息\n"
-            "/日志\n\n"
-            "成员管理\n"
-            "/禁言 @成员 [时长]\n"
-            "/禁言 @成员A @成员B 10m\n"
-            "/更新禁言 @成员 [时长]\n"
-            "/解禁 @成员\n"
-            "/移出 @成员 [拉黑]\n"
-            "/拉黑 openids\n"
-            "/取消拉黑 openids\n"
-            "禁言或更新禁言不填时长默认 10 分钟。时长示例：600（秒）、10m、30分钟、2h、1d；最长 30 天。\n\n"
-            "入群审核\n"
-            "/同意 member request\n"
-            "/拒绝 member request [reason]\n"
-            "member 与 request 请从待处理入群申请中获取。\n\n"
-            "菜单设置与入群策略（AstrBot 管理员）\n"
-            "/设置菜单｜/移除菜单\n"
-            "/策略列表 [cursor]\n"
+def help_panel(topic: str = "") -> Panel:
+    if topic == "策略":
+        return Panel(
+            "入群策略",
+            "/策略列表\n"
             "/策略创建 JSON\n"
-            "/策略修改 id JSON\n"
-            "/策略删除 id\n"
-            "/策略执行 id\n"
-            "/策略白名单 id add|del qq逗号列表\n\n"
-            "消息管理\n"
-            "/撤回 messageid\n"
-            "/通知 text\n"
-            "/全体通知 text\n"
-            "撤回限 2 分钟内；撤回普通成员消息要求机器人是群管理员。\n"
-            "全体通知要求机器人是群管理员，每群每个自然日限 1 次。\n\n"
-            "命令参数完整并通过权限检查后直接执行。按钮不可用时可直接发送对应命令。"
+            "/策略修改 ID JSON\n"
+            "/策略删除 ID\n"
+            "/策略执行 ID\n"
+            "/策略白名单 ID add|del QQ号[,QQ号]\n"
+            "仅 AstrBot 管理员可用；策略可能关联多个群。",
+            [ButtonSpec("返回帮助", "帮助"), ButtonSpec("策略列表", "策略列表")],
+        )
+    if topic == "消息":
+        return Panel(
+            "消息管理",
+            "/最近消息\n"
+            "/撤回 消息ID（限 2 分钟内）\n"
+            "/通知 内容\n"
+            "/全体通知 内容\n"
+            "全体通知需机器人为群管理员，每群每天限 1 次。",
+            [ButtonSpec("返回帮助", "帮助"), ButtonSpec("最近消息", "最近消息")],
+        )
+    if topic:
+        raise ValueError("用法：/帮助 [策略|消息]")
+    return Panel(
+        title="群管帮助",
+        body=(
+            "/菜单：快捷按钮；补全参数发送即执行\n"
+            "/禁言 @成员 [时长]（默认 10 分钟）\n"
+            "/更新禁言 @成员 [时长]｜/解禁 @成员\n"
+            "/移出 @成员 [拉黑]｜/拉黑 @成员｜/取消拉黑 @成员\n"
+            "/成员｜/成员详情 @成员｜/黑名单｜/禁言状态\n"
+            "/入群｜/同意 成员ID 申请ID｜/拒绝 成员ID 申请ID [理由]\n"
+            "/信息｜/状态｜/身份｜/日志\n"
+            "/帮助 消息｜/帮助 策略\n"
+            "@请选择真实成员；可多选。时长支持 10m、2h、1d，最长 30 天。"
         ),
-        buttons=[ButtonSpec("返回菜单", "菜单"), ButtonSpec("我的身份", "身份")],
+        buttons=[
+            ButtonSpec("返回菜单", "菜单"),
+            ButtonSpec("消息管理", "帮助 消息"),
+            ButtonSpec("入群策略", "帮助 策略"),
+        ],
     )
 
 

@@ -114,7 +114,8 @@ class LocalStore:
             with self._lock, self._db:
                 self._db.execute(
                     "UPDATE audit SET status=?,detail=? WHERE id=?",
-                    (status, detail[:1500], audit_id),
+                    # Keep both failure lists for a 20-member batch intact.
+                    (status, detail[:8000], audit_id),
                 )
 
         await asyncio.to_thread(write)

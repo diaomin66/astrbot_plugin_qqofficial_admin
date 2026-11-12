@@ -26,7 +26,7 @@
     "description": "使用原生 Markdown 和按钮面板",
     "type": "bool",
     "default": true,
-    "hint": "发送明确被平台拒绝时自动降级为文本命令。按钮需要开放平台 INTERACTION_CREATE 事件订阅和账号实际权限。"
+    "hint": "控制菜单和查询面板；含真实 @成员的操作回执仍使用 Markdown。平台明确拒绝时降级为文本。按钮需订阅 INTERACTION_CREATE 并具备账号权限。"
   },
   "request_timeout": {
     "description": "官方 API 请求超时（秒）",

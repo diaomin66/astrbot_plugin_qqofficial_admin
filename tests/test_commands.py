@@ -36,7 +36,10 @@ class CommandTests(unittest.TestCase):
                     "禁言 member-1 10m",
                 )
         self.assertEqual(normalize_command(event_for("/群管")), "面板")
-        self.assertTrue({"禁言", "解禁", "身份", "我的ID", "确认", "取消"} <= DIRECT_COMMANDS)
+        self.assertTrue(
+            {"禁言", "解禁", "身份", "我的ID", "菜单", "面板", "确认", "取消"} <= DIRECT_COMMANDS
+        )
+        self.assertTrue({"设置菜单", "菜单状态", "移除菜单"}.isdisjoint(DIRECT_COMMANDS))
 
     def test_native_markup_and_legacy_mentions_use_group_identity(self):
         for markup in ('<qqbot-at-user id="target-user" />', "<@target-user>", "<@!target-user>"):

@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from qq_admin.pagination import MAX_SNAPSHOT_CHARACTERS, ResultPager
-from qq_admin.panels import MAX_MARKDOWN_LENGTH, ButtonSpec, build_payload
+from qq_admin.panels import MAX_MARKDOWN_LENGTH, ButtonSpec, build_payload, render_plain_panel
 
 
 class PaginationTests(unittest.TestCase):
@@ -44,7 +44,7 @@ class PaginationTests(unittest.TestCase):
         )
         panels = self.collect(first)
         self.assertGreater(len(panels), 1)
-        restored = "".join(panel.body.rsplit("\n\n结果分页：", 1)[0] for panel in panels)
+        restored = "".join(panel.body for panel in panels)
         self.assertEqual(restored, json.dumps(data, ensure_ascii=False, indent=2))
         for index in range(30):
             self.assertIn(f"member-{index:02}", restored)
@@ -55,9 +55,7 @@ class PaginationTests(unittest.TestCase):
         text = "<qqbot-at-everyone />&_[]\\*中文😀" * 600
         panels = self.collect(self.pager.show(self.ctx, "特殊字符", text))
         self.assertGreater(len(panels), 2)
-        self.assertEqual(
-            "".join(panel.body.rsplit("\n\n结果分页：", 1)[0] for panel in panels), text
-        )
+        self.assertEqual("".join(panel.body for panel in panels), text)
         for panel in panels:
             payload = build_payload(panel, self.ctx, lambda action, data: "encoded")
             content = payload["markdown"]["content"]
@@ -145,13 +143,44 @@ class PaginationTests(unittest.TestCase):
 
     def test_single_empty_page_and_back_navigation_work(self):
         panel = self.pager.show(self.ctx, "成员", {"members": [], "next_cursor": ""}, buttons=[])
-        self.assertIn("最后一页", panel.body)
+        self.assertEqual(panel.title, "成员")
+        self.assertEqual(panel.body, json.dumps({"members": [], "next_cursor": ""}, indent=2))
         self.assertEqual(panel.buttons, [])
         first = self.pager.show(self.ctx, "长结果", "x" * 7000)
         second = self.pager.page(self.ctx, *self.next_command(first))
         previous = next(button for button in second.buttons if button.label == "上一段")
         _, token, index = previous.command.split()
         self.assertEqual(self.pager.page(self.ctx, token, int(index)).body, first.body)
+
+    def test_single_text_result_has_no_pagination_noise_and_keeps_next_api_page(self):
+        text = "小明 · 管理员\n成员ID：member-1\n还有下一页"
+        next_page = ButtonSpec("下一页", "成员 opaque-cursor")
+        panel = self.pager.show(self.ctx, "群成员", text, [next_page])
+        self.assertEqual(panel.title, "群成员")
+        self.assertEqual(panel.body, text)
+        self.assertEqual(panel.buttons, [next_page])
+        content = build_payload(panel, self.ctx, lambda *_: "encoded")["markdown"]["content"]
+        for removed in ("1/1", "结果分页", "5 分钟", "opaque-cursor"):
+            self.assertNotIn(removed, content)
+        self.assertEqual(render_plain_panel(panel).count("/成员 opaque-cursor"), 1)
+
+    def test_multiple_segments_only_add_position_and_navigation_buttons(self):
+        text = "一条完整记录<&>\n" * 2000
+        panels = self.collect(self.pager.show(self.ctx, "成员", text, buttons=[]))
+        self.assertGreater(len(panels), 1)
+        self.assertEqual("".join(panel.body for panel in panels), text)
+        for index, panel in enumerate(panels):
+            self.assertEqual(panel.title, f"成员（第 {index + 1}/{len(panels)} 段）")
+            for removed in ("结果分页", "5 分钟", "上一段：", "下一段：", "/结果 "):
+                self.assertNotIn(removed, panel.body)
+            self.assertEqual(
+                {button.label for button in panel.buttons},
+                ({"上一段"} if index else set())
+                | ({"下一段"} if index + 1 < len(panels) else set()),
+            )
+            plain = render_plain_panel(panel)
+            for button in panel.buttons:
+                self.assertEqual(plain.count("/" + button.command), 1)
 
 
 if __name__ == "__main__":

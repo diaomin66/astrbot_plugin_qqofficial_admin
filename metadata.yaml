@@ -1,7 +1,7 @@
 name: astrbot_plugin_qqofficial_admin
 display_name: QQ 官方群管
-desc: QQ 官方指令菜单与群管理，支持直接执行、原生按钮、禁言、成员管理、入群审批及策略。
-version: v1.2.2
+desc: QQ 官方群管理，支持简短指令、成员提及、快捷按钮、禁言、成员管理、入群审批及策略。
+version: v1.3.0
 author: QQ Official Admin Contributors
 repo: https://github.com/diaomin66/astrbot_plugin_qqofficial_admin
 astrbot_version: '>=4.29.4'

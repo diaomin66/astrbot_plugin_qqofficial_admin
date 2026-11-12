@@ -19,7 +19,7 @@ from .qq_admin.integration import (
     send_payload,
 )
 from .qq_admin.manager import WRITE_COMMANDS, AdminManager, split_head
-from .qq_admin.panels import Panel, build_payload
+from .qq_admin.panels import MemberMention, Panel, build_payload, render_plain_panel, text_reply
 from .qq_admin.security import AccessControl
 from .qq_admin.store import LocalStore
 
@@ -40,20 +40,14 @@ RICH_MESSAGE_REJECTIONS = {
 
 
 def _plain_panel(panel: Panel) -> str:
-    text = f"{panel.title}\n\n{panel.body}"
-    if panel.buttons:
-        text += "\n\n可用命令：\n" + "\n".join(
-            f"{button.label}：/{button.command}" for button in panel.buttons
-        )
-    # QQ's XML-like mention tags are executable even in plain messages.
-    return text.replace("<", "＜").replace(">", "＞")
+    return render_plain_panel(panel)
 
 
 @register(
     "astrbot_plugin_qqofficial_admin",
     "QQ Official Admin Contributors",
     "QQ 官方群管理、原生按钮与入群审批",
-    "1.2.2",
+    "1.3.0",
 )
 class QQOfficialAdmin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -121,7 +115,7 @@ class QQOfficialAdmin(Star):
         "菜单", alias=(set(DIRECT_COMMANDS) - {"菜单", "help"}) | {"群管", "qqadmin"}, priority=100
     )
     async def admin_command(self, event: AstrMessageEvent):
-        """/设置菜单 安装 QQ 官方指令菜单；/禁言 @成员 直接执行；/菜单 打开快捷入口。"""
+        """/禁言 @成员 直接执行；/菜单 打开消息内快捷按钮。"""
         if self._closing or not self.config.get("enabled", True):
             return
         ctx = extract_event_context(event)
@@ -131,7 +125,7 @@ class QQOfficialAdmin(Star):
         try:
             command = normalize_command(event)
         except ValueError as exc:
-            await self._deliver(event, Panel("未执行操作", str(exc)))
+            await self._deliver(event, text_reply(str(exc)))
             return
         await self._dispatch(event, command)
 
@@ -192,6 +186,8 @@ class QQOfficialAdmin(Star):
         ctx = extract_event_context(event)
         if self._closing or ctx is None or self._manager is None:
             return
+        head = split_head(command)[0]
+        operation = f"/{head}" if head in DIRECT_COMMANDS else "管理查询"
         try:
             self._manager.access.check_group(ctx)
             if split_head(command)[0] in WRITE_COMMANDS and reply_age_seconds(event) >= 300:
@@ -205,26 +201,17 @@ class QQOfficialAdmin(Star):
                 ctx, command, QQGroupAPI(transport), request_key=request_key
             )
         except QQAPIError as exc:
-            head = split_head(command)[0]
-            operation = f"/{head}" if head in DIRECT_COMMANDS else "管理查询"
             logger.warning(f"QQ 官方群管 {operation} 请求失败：{exc.user_message()}")
-            panel = Panel(
-                "官方接口暂不可用",
-                f"指令：{operation}\n{exc.user_message()}",
-                prefer_plain_text=True,
-            )
+            panel = text_reply(exc.concise_message())
         except ValueError as exc:
-            panel = Panel("未执行操作", str(exc))
-        except Exception:
-            logger.error("QQ 官方群管处理异常，请检查插件配置与数据目录。")
-            panel = Panel(
-                "处理失败",
-                "未能完成本次请求，请先通过日志或状态查询核实结果，再决定是否发送新指令。",
-            )
+            panel = text_reply(str(exc))
+        except Exception as exc:
+            logger.error(f"QQ 官方群管 {operation} 处理异常（{type(exc).__name__}）。")
+            panel = text_reply("结果未确认，请先查询状态。")
         await self._deliver(event, panel)
 
     async def _respond_error(self, event: AstrMessageEvent, message: str):
-        await self._deliver(event, Panel("无法使用此按钮", message))
+        await self._deliver(event, text_reply(message))
 
     async def _deliver(self, event: AstrMessageEvent, panel: Panel):
         if self._closing:
@@ -241,7 +228,14 @@ class QQOfficialAdmin(Star):
         ctx = extract_event_context(event)
         if ctx is None:
             return None
-        if self.config.get("use_markdown", True) and not panel.prefer_plain_text:
+        member_reply = any(isinstance(part, MemberMention) for part in panel.content_parts)
+        # QQ group member mentions are documented only for Markdown messages.
+        # The panel preference must not silently turn a real @ into plain text.
+        if member_reply or (
+            self.config.get("use_markdown", True)
+            and not panel.prefer_plain_text
+            and not panel.content_parts
+        ):
             encoder = partial(encode_callback, expires_at=time.time() + 300)
             payload = build_payload(panel, ctx, encoder)
         else:

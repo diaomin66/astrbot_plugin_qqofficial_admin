@@ -38,10 +38,16 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         access = AccessControl({"allow_group_admins": True})
-        with self.assertRaises(PermissionDenied) as caught:
-            await access.require(context(), api)
-        self.assertIn("11253", str(caught.exception))
+        with self.assertLogs("qq_admin.security", level="WARNING") as logs:
+            with self.assertRaises(PermissionDenied) as caught:
+                await access.require(context(), api)
+        self.assertEqual(
+            str(caught.exception), "无法验证管理员身份，请联系 AstrBot 管理员配置权限。"
+        )
+        self.assertNotIn("11253", str(caught.exception))
         self.assertNotIn("secret upstream", str(caught.exception))
+        self.assertIn("11253", "\n".join(logs.output))
+        self.assertNotIn("secret upstream", "\n".join(logs.output))
         api.get_member.assert_awaited_once_with("group-a", "member-a")
 
     async def test_trusted_admin_matches_all_three_context_identifiers(self):

@@ -7,7 +7,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,7 +17,6 @@ from .panels import MAX_MARKDOWN_LENGTH, ButtonSpec, Panel, PanelContext, escape
 # explicitly, so a caller can narrow its query without silently losing records.
 MAX_SNAPSHOT_CHARACTERS = 262_144
 MAX_CACHED_CHARACTERS = 2_097_152
-_FOOTER_RESERVE = 450
 _PAGE_TITLE_RESERVE = 40
 
 
@@ -27,7 +26,6 @@ class _Snapshot:
     title: str
     chunks: tuple[str, ...]
     buttons: tuple[ButtonSpec, ...]
-    pagination_hint: str
     global_operation: bool
     expires_at: float
     character_count: int
@@ -150,17 +148,10 @@ class ResultPager:
             raise ValueError("结果分页每段最多附带 10 个操作按钮")
 
         title_size = len(escape_markdown(title).replace("\n", " "))
-        budget = MAX_MARKDOWN_LENGTH - title_size - 5 - _FOOTER_RESERVE - _PAGE_TITLE_RESERVE
+        budget = MAX_MARKDOWN_LENGTH - title_size - 5 - _PAGE_TITLE_RESERVE
         if budget < 256:
             raise ValueError("结果标题过长，请缩短标题")
         chunks = _split_complete_text(text, budget)
-        hint = ""
-        if isinstance(data, Mapping) and "next_cursor" in data:
-            if data["next_cursor"] not in (None, ""):
-                hint = "接口仍有下一页；完整结果中包含 next_cursor。"
-            else:
-                hint = "接口已到最后一页。"
-
         with self._lock:
             now = self._clock()
             self._cleanup(now)
@@ -177,7 +168,6 @@ class ResultPager:
                 title,
                 chunks,
                 base_buttons,
-                hint,
                 bool(global_operation),
                 now + self._ttl,
                 len(text),
@@ -204,20 +194,19 @@ class ResultPager:
     @staticmethod
     def _panel(token: str, snapshot: _Snapshot, index: int) -> Panel:
         total = len(snapshot.chunks)
-        footer = f"\n\n结果分页：第 {index + 1}/{total} 段；查询后 5 分钟内可翻阅。"
-        if snapshot.pagination_hint:
-            footer += "\n" + snapshot.pagination_hint
         navigation: list[ButtonSpec] = []
         if index > 0:
             command = f"结果 {token} {index - 1}"
             navigation.append(ButtonSpec("上一段", command))
-            footer += f"\n上一段：/{command}"
         if index + 1 < total:
             command = f"结果 {token} {index + 1}"
             navigation.append(ButtonSpec("下一段", command))
-            footer += f"\n下一段：/{command}"
+        title = snapshot.title
+        if total > 1:
+            position = f"第 {index + 1}/{total} 段"
+            title = f"{title}（{position}）" if title else position
         return Panel(
-            title=f"{snapshot.title}（{index + 1}/{total}）",
-            body=snapshot.chunks[index] + footer,
+            title=title,
+            body=snapshot.chunks[index],
             buttons=navigation + list(snapshot.buttons),
         )

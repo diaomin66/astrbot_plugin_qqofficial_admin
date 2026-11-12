@@ -13,9 +13,10 @@ from typing import Any
 
 from .api import QQAPIError, QQGroupAPI
 from .diagnostics import RequestState, current_request_state
-from .official_menu import OfficialMenu
+from .outcomes import write_result
 from .pagination import ResultPager
-from .panels import ButtonSpec, Panel, help_panel, home_panel
+from .panels import ButtonSpec, Panel, help_panel, home_panel, text_reply
+from .presentation import format_read_result
 from .security import AccessControl
 from .store import LocalStore
 
@@ -27,8 +28,6 @@ GLOBAL_COMMANDS = {
     "策略删除",
     "策略执行",
     "策略白名单",
-    "设置菜单",
-    "移除菜单",
 }
 WRITE_COMMANDS = {
     "移出",
@@ -47,8 +46,6 @@ WRITE_COMMANDS = {
     "撤回",
     "通知",
     "全体通知",
-    "设置菜单",
-    "移除菜单",
 }
 HOME = ButtonSpec("返回菜单", "菜单")
 DEFAULT_MUTE_SECONDS = 600
@@ -169,7 +166,6 @@ class AdminManager:
         self.access = AccessControl(config)
         self.messages = RecentMessages()
         self.pager = ResultPager()
-        self.menu = OfficialMenu()
 
     async def handle(self, ctx: Any, text: str, api: QQGroupAPI, *, request_key: str = "") -> Panel:
         self.access.check_group(ctx)
@@ -178,39 +174,27 @@ class AdminManager:
         command, args = split_head(text)
         command = command or "菜单"
         if command in {"帮助", "help"}:
-            return help_panel()
+            return help_panel(args.strip())
         if command in {"身份", "我的ID"}:
             return Panel(
                 "当前身份",
-                f"平台 ID：{ctx.platform_id}\n群 OpenID：{ctx.group_id}\n"
-                f"成员 OpenID：{ctx.user_id}\nAstrBot 管理员：{'是' if ctx.is_superuser else '否'}\n\n"
-                f"受信任管理员配置项：\n{ctx.platform_id}|{ctx.group_id}|{ctx.user_id}",
-                [HOME],
+                f"AstrBot 管理员：{'是' if ctx.is_superuser else '否'}\n"
+                f"管理员配置：{ctx.platform_id}|{ctx.group_id}|{ctx.user_id}",
             )
         if command in {"菜单", "面板"}:
             return home_panel()
         if command in {"确认", "取消"}:
-            return Panel(
-                "旧指令已停用",
-                "管理指令已改为直接执行。旧确认记录已失效，请发送新的管理指令。",
-                [HOME],
-            )
+            return text_reply("确认指令已停用，请直接发送管理命令。")
         await self.access.require(ctx, api, global_operation=command in GLOBAL_COMMANDS)
         if command in WRITE_COMMANDS:
-            action, params, summary = self._parse_write(ctx, command, args)
+            action, params = self._parse_write(command, args)
             request_key = request_key or (f"message:{ctx.message_id}" if ctx.message_id else "")
             audit_id = await self.store.claim_execution(ctx, request_key, action, params)
-            return await self._run_write(ctx, action, params, summary, audit_id, api)
+            return await self._run_write(ctx, action, params, audit_id, api)
         return await self._read(ctx, command, args, api)
 
     async def _read(self, ctx: Any, command: str, args: str, api: QQGroupAPI) -> Panel:
         group = ctx.group_id
-        if command == "菜单状态":
-            if args.strip():
-                raise ValueError("用法：/菜单状态，仅查询当前群的官方指令面板。")
-            return self.pager.show(
-                ctx, "官方指令菜单状态", await self.menu.status(ctx, api), [HOME]
-            )
         if command == "结果":
             token, index = split_head(args)
             try:
@@ -219,11 +203,11 @@ class AdminManager:
                 raise ValueError("请使用结果分页按钮，或 /结果 令牌 段号。") from exc
             return self.pager.page(ctx, token, index)
         if command == "信息":
-            return self.pager.show(ctx, "群信息", await api.get_group_info(group), [HOME])
+            return self._read_result(ctx, command, "群信息", await api.get_group_info(group))
         if command == "状态":
-            return self.pager.show(ctx, "机器人群内状态", await api.get_bot_state(group), [HOME])
+            return self._read_result(ctx, command, "机器人状态", await api.get_bot_state(group))
         if command == "禁言状态":
-            return self.pager.show(ctx, "群禁言状态", await api.get_mute_state(group), [HOME])
+            return self._read_result(ctx, command, "禁言状态", await api.get_mute_state(group))
         if command == "成员":
             data = await api.list_members(group, cursor=args.strip())
             buttons = []
@@ -233,8 +217,8 @@ class AdminManager:
                     buttons.append(
                         ButtonSpec(str(row.get("username") or member)[:10], f"成员详情 {member}")
                     )
-            return self.pager.show(
-                ctx, "群成员", data, buttons + _page_button(data, "成员") + [HOME]
+            return self._read_result(
+                ctx, command, "群成员", data, buttons + _page_button(data, "成员")
             )
         if command == "成员详情":
             member = parse_ids(args, 1)[0]
@@ -247,7 +231,7 @@ class AdminManager:
                 ButtonSpec("移出并拉黑", f"移出 {member} 拉黑", danger=True),
                 HOME,
             ]
-            return self.pager.show(ctx, "成员详情", data, buttons)
+            return self._read_result(ctx, command, "成员详情", data, buttons)
         if command == "黑名单":
             data = await api.list_blacklist(group, cursor=args.strip())
             buttons = []
@@ -259,14 +243,15 @@ class AdminManager:
                             "解除" + str(row.get("username") or member)[:8], f"取消拉黑 {member}"
                         )
                     )
-            return self.pager.show(
-                ctx, "群黑名单", data, buttons + _page_button(data, "黑名单") + [HOME]
+            return self._read_result(
+                ctx, command, "黑名单", data, buttons + _page_button(data, "黑名单")
             )
         if command == "入群":
             data = await api.list_join_requests(group, cursor=args.strip(), limit=4)
             buttons = []
-            for index, row in enumerate(_rows(data, "list"), 1):
-                if "auto_approved" in row:
+            rows = data.get("list")
+            for index, row in enumerate(rows if isinstance(rows, list) else [], 1):
+                if not isinstance(row, dict) or "auto_approved" in row:
                     continue
                 member, request = row.get("member_openid"), row.get("join_request_id")
                 if member and request and len(buttons) < 8:
@@ -276,21 +261,21 @@ class AdminManager:
                             ButtonSpec(f"拒绝申请{index}", f"拒绝 {member} {request}"),
                         ]
                     )
-            return self.pager.show(
-                ctx, "入群申请（包含验证信息）", data, buttons + _page_button(data, "入群") + [HOME]
+            return self._read_result(
+                ctx, command, "入群申请", data, buttons + _page_button(data, "入群")
             )
         if command == "策略列表":
             data = await api.list_strategies(cursor=args.strip())
-            return self.pager.show(
+            return self._read_result(
                 ctx,
-                "机器人全局审批策略",
+                command,
+                "审批策略",
                 data,
-                _page_button(data, "策略列表") + [HOME],
-                global_operation=True,
+                _page_button(data, "策略列表"),
             )
         if command == "日志":
-            return self.pager.show(
-                ctx, "本群最近操作记录", {"audit": await self.store.recent_audit(ctx)}, [HOME]
+            return self._read_result(
+                ctx, command, "操作日志", {"audit": await self.store.recent_audit(ctx)}
             )
         if command == "最近消息":
             rows = self.messages.list(ctx)
@@ -298,36 +283,36 @@ class AdminManager:
                 ButtonSpec(f"撤回消息{i}", f"撤回 {row['message_id']}")
                 for i, row in enumerate(rows[:6], 1)
             ]
-            return self.pager.show(
-                ctx, "最近两分钟可见的消息", {"messages": rows}, buttons + [HOME]
-            )
+            return self._read_result(ctx, command, "最近消息", {"messages": rows}, buttons)
         raise ValueError("未识别的管理命令。发送 /帮助 查看可用命令。")
 
-    def _parse_write(self, ctx: Any, command: str, args: str) -> tuple[str, dict, str]:
-        scope = f"群 OpenID：{ctx.group_id}"
-        if command in {"设置菜单", "移除菜单"}:
-            if args.strip():
-                raise ValueError(f"用法：/{command}，仅管理当前群的官方指令面板。")
-            return command, {}, f"{scope}\n{command}：当前群的 QQ 官方指令面板。"
+    def _read_result(
+        self,
+        ctx: Any,
+        command: str,
+        title: str,
+        data: dict,
+        buttons: list[ButtonSpec] | None = None,
+    ) -> Panel:
+        return self.pager.show(
+            ctx,
+            title,
+            format_read_result(command, data),
+            buttons or [],
+            global_operation=command in GLOBAL_COMMANDS,
+        )
+
+    def _parse_write(self, command: str, args: str) -> tuple[str, dict]:
         if command == "移出":
             add_blacklist = args.endswith(" 拉黑")
             ids = parse_ids(args[:-3].strip() if add_blacklist else args, 20)
             return (
                 command,
                 {"members": ids, "add_to_blacklist": add_blacklist},
-                (
-                    f"{scope}\n移出 {len(ids)} 名成员：\n"
-                    + "\n".join(ids)
-                    + ("\n同时加入群黑名单。" if add_blacklist else "\n不会同时加入黑名单。")
-                ),
             )
         if command in {"拉黑", "取消拉黑", "解禁"}:
             ids = parse_ids(args, 20)
-            return (
-                command,
-                {"members": ids},
-                f"{scope}\n{command} {len(ids)} 名成员：\n" + "\n".join(ids),
-            )
+            return command, {"members": ids}
         if command in {"禁言", "更新禁言"}:
             parts = args.rsplit(maxsplit=1)
             if not parts or (
@@ -345,7 +330,6 @@ class AdminManager:
             return (
                 command,
                 {"members": ids, "seconds": seconds},
-                (f"{scope}\n{command} {len(ids)} 名成员，执行起 {seconds} 秒：\n" + "\n".join(ids)),
             )
         if command in {"同意", "拒绝"}:
             member, rest = split_head(args)
@@ -366,10 +350,7 @@ class AdminManager:
                 "reason": reason,
                 "add_to_blacklist": blacklist,
             }
-            summary = f"{scope}\n{command}入群申请\n成员：{member}\n申请 ID：{request}"
-            if command == "拒绝":
-                summary += f"\n理由：{reason or '未填写'}\n同时拉黑：{'是' if blacklist else '否'}"
-            return command, params, summary
+            return command, params
         if command == "策略创建":
             params = json_object(
                 args, {"group_openids", "group_ids", "is_enable", "expire_at", "remark"}
@@ -377,18 +358,15 @@ class AdminManager:
             if ("group_openids" in params) == ("group_ids" in params):
                 raise ValueError("创建策略必须选择 group_openids 或 group_ids 中的一种。")
             params.setdefault("is_enable", "on")
-            return command, params, self._strategy_summary(command, params)
+            return command, params
         if command == "策略修改":
             strategy_id, body = split_head(args)
             params = json_object(body, {"is_enable", "expire_at", "group_action", "remark"})
             params["strategy_id"] = self._strategy_id(strategy_id)
-            return command, params, self._strategy_summary(command, params)
+            return command, params
         if command in {"策略删除", "策略执行"}:
             params = {"strategy_id": self._strategy_id(args.strip())}
-            summary = self._strategy_summary(command, params)
-            if command == "策略执行":
-                summary += "\n将扫描此策略关联的所有群，官方异步处理预计约 10 分钟。"
-            return command, params, summary
+            return command, params
         if command == "策略白名单":
             strategy_id, rest = split_head(args)
             op, numbers = split_head(rest)
@@ -402,7 +380,7 @@ class AdminManager:
                 "op": op,
                 "whitelist_users": users,
             }
-            return command, params, self._strategy_summary(command, params)
+            return command, params
         if command == "撤回":
             message_id = args.strip()
             if (
@@ -411,24 +389,14 @@ class AdminManager:
                 or any(char.isspace() for char in message_id)
             ):
                 raise ValueError("用法：/撤回 消息ID。ID 来自最近消息或官方消息事件 d.id。")
-            return (
-                command,
-                {"message_id": message_id},
-                (
-                    f"{scope}\n撤回消息：{message_id}\n平台限制：发送后 2 分钟内；"
-                    "撤回普通成员消息要求机器人拥有群管理员身份。"
-                ),
-            )
+            return command, {"message_id": message_id}
         if command in {"通知", "全体通知"}:
             if not args.strip() or len(args) > 1500:
                 raise ValueError("通知内容须为 1–1500 字符。")
             if re.search(r"<\s*/?\s*qqbot[-:]|<@|@everyone", args, re.I):
                 raise ValueError("通知请使用普通文本；@全体请使用 /全体通知。")
             params = {"text": args, "everyone": command == "全体通知"}
-            summary = f"{scope}\n{command}内容：\n{args}"
-            if params["everyone"]:
-                summary += "\n\n将 @全体成员，机器人必须为管理员，每群每天仅一次。"
-            return command, params, summary
+            return command, params
         raise ValueError("不支持的写入操作。")
 
     @staticmethod
@@ -437,23 +405,14 @@ class AdminManager:
             raise ValueError("请提供正确的策略 ID，使用 /策略列表 查询。")
         return value
 
-    @staticmethod
-    def _strategy_summary(command: str, params: dict) -> str:
-        summary = f"{command}（机器人全局操作）\n此操作可能影响策略关联的其他群。\n" + json.dumps(
-            params, ensure_ascii=False, indent=2
-        )
-        if command == "策略创建" and "expire_at" not in params:
-            summary += "\n未指定到期时间，官方默认有效期为一年。"
-        return summary
-
     async def _run_write(
-        self, ctx: Any, action: str, params: dict, summary: str, audit_id: int, api: QQGroupAPI
+        self, ctx: Any, action: str, params: dict, audit_id: int, api: QQGroupAPI
     ) -> Panel:
         # Each command owns its state even when commands share one transport.
         state = RequestState()
         token = current_request_state.set(state)
         try:
-            return await self._run_tracked_write(ctx, action, params, summary, audit_id, api, state)
+            return await self._run_tracked_write(ctx, action, params, audit_id, api, state)
         finally:
             current_request_state.reset(token)
 
@@ -462,7 +421,6 @@ class AdminManager:
         ctx: Any,
         action: str,
         params: dict,
-        summary: str,
         audit_id: int,
         api: QQGroupAPI,
         state: RequestState,
@@ -490,18 +448,13 @@ class AdminManager:
                 or exc.status >= 500
             )
             if not mutation_sent:
-                title = "未执行操作"
-                suffix = "\n未发送修改请求。本次请求不会自动重试，请根据诊断检查后重新发起。"
+                message = "未执行：" + exc.concise_message()
             elif unknown:
-                title = "操作结果尚未确认"
-                check = "发送 /菜单状态 查询" if action in {"设置菜单", "移除菜单"} else "查询"
-                suffix = f"\n本次请求不会自动重试。请先{check}实际状态，再决定是否发送新指令。"
+                message = "结果未确认，请先查询状态。"
             else:
-                title = "官方接口未执行成功"
-                suffix = "\n本次请求不会自动重试。请检查参数及接口权限后发送新指令。"
-            detail = exc.user_message() + suffix
+                message = f"{action}失败：" + exc.concise_message()
             status = "unknown" if unknown else "failed"
-            await self._finish(audit_id, status, detail)
+            await self._finish(audit_id, status, exc.user_message())
             logger.warning(
                 "QQ group administration /%s (audit %s, %s): %s",
                 action,
@@ -509,19 +462,13 @@ class AdminManager:
                 status,
                 exc.user_message(),
             )
-            return Panel(title, f"指令：/{action}\n" + detail, [HOME], prefer_plain_text=True)
+            return text_reply(message)
         except ValueError as exc:
             if state.mutation_started:
                 await self._finish(audit_id, "unknown", "修改请求已发起，但后续校验未完成。")
-                return Panel(
-                    "操作结果尚未确认",
-                    f"修改请求已发起，但后续校验未完成，操作记录 #{audit_id}。请先查询实际状态。",
-                    [HOME],
-                )
+                return text_reply("结果未确认，请先查询状态。")
             await self._finish(audit_id, "failed", str(exc))
-            return Panel(
-                "参数未通过校验", str(exc) + "\n未发送此操作，请修正参数后重新发起。", [HOME]
-            )
+            return text_reply(str(exc))
         except Exception:
             # Once claimed, an unexpected exception must not silently make the
             # same mutation available again. Do not reflect exception secrets.
@@ -533,50 +480,19 @@ class AdminManager:
             )
             await self._finish(audit_id, "unknown" if unknown else "failed", message)
             logger.error("QQ group administration execution failed (audit %s)", audit_id)
-            return Panel(
-                "操作结果尚未确认" if unknown else "未执行操作",
-                f"{message}\n操作记录 #{audit_id}。",
-                [HOME],
-            )
-        failures = result.get("fail_openids") or result.get("add_to_member_blacklist_fail_openids")
-        status = "partial" if failures else "success"
-        await self._finish(audit_id, status, "部分成员操作失败" if failures else "官方接口返回成功")
-        if action == "策略执行":
-            return self._write_result(
-                ctx,
-                action,
-                "策略执行请求已受理",
-                {"说明": "平台异步处理，通常约 10 分钟；尚不表示申请已通过。", **result},
-            )
-        return self._write_result(
-            ctx,
-            action,
-            "部分操作未成功" if failures else "操作已完成",
-            summary
-            + "\n\n"
-            + (
-                json.dumps(result, ensure_ascii=False, indent=2)
-                if result
-                else "官方接口已返回成功。"
-            ),
-        )
-
-    def _write_result(self, ctx: Any, action: str, title: str, data: Any) -> Panel:
-        try:
-            panel = self.pager.show(
-                ctx, title, data, [HOME], global_operation=action in GLOBAL_COMMANDS
-            )
-            if not any(button.command.startswith("结果 ") for button in panel.buttons):
-                panel.title = title
-            return panel
-        except ValueError:
-            # Rendering failure after a completed write must not suggest that
-            # the operation never ran or encourage a blind retry.
-            return Panel(
-                title,
-                "官方接口已返回结果，但内容过大无法完整显示。请通过 /日志 和对应状态查询核实，勿直接重复操作。",
-                [HOME],
-            )
+            return text_reply("结果未确认，请先查询状态。" if unknown else "处理失败，未执行操作。")
+        status, panel = write_result(action, params, result)
+        detail = panel.body
+        if action == "移出" and status in {"partial", "failed"}:
+            for key, label in (
+                ("fail_openids", "移出失败"),
+                ("add_to_member_blacklist_fail_openids", "拉黑失败"),
+            ):
+                failed = [member for member in params["members"] if member in result.get(key, [])]
+                if failed:
+                    detail += f"\n{label}：" + "、".join(failed)
+        await self._finish(audit_id, status, detail)
+        return panel
 
     async def _finish(self, audit_id: int, status: str, detail: str) -> None:
         try:
@@ -586,10 +502,6 @@ class AdminManager:
 
     async def _execute(self, ctx: Any, action: str, params: dict, api: QQGroupAPI) -> dict:
         group = ctx.group_id
-        if action == "设置菜单":
-            return await self.menu.install(ctx, api)
-        if action == "移除菜单":
-            return await self.menu.remove(ctx, api)
         if action == "移出":
             return await api.remove_members(
                 group, params["members"], add_to_blacklist=params["add_to_blacklist"]

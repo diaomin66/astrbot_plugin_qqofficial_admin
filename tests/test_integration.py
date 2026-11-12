@@ -303,7 +303,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 transport = BotpyTransport(make_bot())
                 with patch("qq_admin.integration.aiohttp.ClientSession", return_value=session):
                     with self.assertRaises(QQAPIError) as caught:
-                        await transport.request("GET", "/v2/panels")
+                        await transport.request("GET", "/v2/groups/group-1/members")
                 self.assertEqual(caught.exception.code, expected_code)
                 self.assertTrue(caught.exception.request_sent)
                 await transport.close()
@@ -316,7 +316,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 session = FakeSession(FakeResponse(200, payload))
                 transport = BotpyTransport(make_bot())
                 with patch("qq_admin.integration.aiohttp.ClientSession", return_value=session):
-                    result = await transport.request("GET", "/v2/panels")
+                    result = await transport.request("GET", "/v2/groups/group-1/members")
                 self.assertEqual(result, payload)
                 await transport.close()
 
@@ -374,7 +374,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 transport = BotpyTransport(make_bot())
                 with patch("qq_admin.integration.aiohttp.ClientSession", return_value=session):
                     with self.assertRaises(QQAPIError) as caught:
-                        await transport.request("GET", "/v2/panels")
+                        await transport.request("GET", "/v2/groups/group-1/members")
                 error = caught.exception
                 self.assertEqual(error.reason, "root_type")
                 self.assertEqual(error.expected, "object")
@@ -393,7 +393,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         transport = BotpyTransport(make_bot())
         with patch("qq_admin.integration.aiohttp.ClientSession", return_value=session):
             with self.assertRaises(QQAPIError) as caught:
-                await transport.request("GET", "/v2/panels")
+                await transport.request("GET", "/v2/groups/group-1/members")
         self.assertEqual(caught.exception.reason, "text_decode")
         self.assertTrue(caught.exception.request_sent)
         self.assertNotIn("private", caught.exception.diagnostic_text())
@@ -416,10 +416,10 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     with patch("qq_admin.integration.aiohttp.ClientSession", return_value=session):
                         if error_response:
                             with self.assertRaises(QQAPIError) as caught:
-                                await transport.request("GET", "/v2/panels")
+                                await transport.request("GET", "/v2/groups/group-1/members")
                             result = caught.exception
                         else:
-                            result = await transport.request("GET", "/v2/panels")
+                            result = await transport.request("GET", "/v2/groups/group-1/members")
                     self.assertEqual(result.trace_id, expected)
                     await transport.close()
 
@@ -473,17 +473,19 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     with patch("qq_admin.integration.aiohttp.ClientSession", return_value=session):
                         with self.assertRaises(QQAPIError) as caught:
-                            await QQGroupAPI(transport).create_panel(
-                                ["g"],
-                                {"items": [{"type": "command", "name": "/help", "desc": "Help"}]},
-                            )
+                            await QQGroupAPI(transport).create_strategy(group_openids=["g"])
                     error = caught.exception
                     self.assertTrue(state.mutation_started)
                     self.assertTrue(error.request_sent)
                     self.assertEqual(error.status, 201)
                     self.assertEqual(error.trace_id, "trace-1")
                     self.assertEqual(error.method, "POST")
-                    self.assertEqual(error.route, "/v2/panels")
+                    self.assertEqual(error.route, "/v2/groups/join_approval_strategy")
+                    self.assertEqual(len(session.calls), 1)
+                    self.assertEqual(
+                        session.calls[0][2]["json"],
+                        {"group_openids": ["g"], "is_enable": "on"},
+                    )
                     self.assertNotIn("private", repr(error))
                 finally:
                     current_request_state.reset(token)

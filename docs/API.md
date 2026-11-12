@@ -1,6 +1,6 @@
 # QQ 官方群管理接口核验
 
-核验日期：**2026-11-11（北京时间）**。依据腾讯 [QQ 机器人官方文档](https://bot.q.qq.com/wiki/develop/api-v2/) 当前发布的 `v1.48.0` 文档，逐页阅读「群聊管理」全部 **17 个接口、7 个事件**，另核验群消息、消息撤回及原生按钮。本文中的「群」均指 QQ 群，不是 QQ 频道（Guild）。
+核验日期：**2026-11-12（北京时间）**。依据腾讯 [QQ 机器人官方文档](https://bot.q.qq.com/wiki/develop/api-v2/) 当前发布的 `v1.48.0` 文档，逐页阅读「群聊管理」全部 **17 个接口、7 个事件**，另核验群消息、消息撤回及原生按钮。本文中的「群」均指 QQ 群，不是 QQ 频道（Guild）。
 
 官方 [变更记录](https://bot.q.qq.com/wiki/develop/api-v2/changelog.html) 说明：2026-08-10 新增群禁言、入群申请及自动审批策略；2026-09-03 新增群成员管理；2026-10-26 新增群 @全体成员。这些接口比旧版 SDK 新，不能据旧教程判断「QQ 官方机器人不能群管」，也不能将频道接口直接套用到 QQ 群。
 
@@ -95,7 +95,7 @@
 
 ### 部分成功必须显示
 
-批量移除成功字段是 `remove_members_result: "success"`。如果同时拉黑，`add_to_member_blacklist_fail_openids` 可能非空，这表示移除成功但部分拉黑失败。单独黑名单操作的 `fail_openids` 非空也表示部分失败。插件保留并显示这些字段，不能只凭 HTTP 200 宣称全部成功。写请求网络超时的结果可能未知，应先查询状态，不能自动重发可能已生效的操作。
+批量移除成功字段是 `remove_members_result: "success"`。如果同时拉黑，`add_to_member_blacklist_fail_openids` 可能非空，这表示移除成功但部分拉黑失败。单独黑名单操作的 `fail_openids` 非空也表示部分失败。插件根据这些字段显示成功和失败数量，详细结果保留在操作记录中，不能只凭 HTTP 200 宣称全部成功。写请求网络超时的结果可能未知，应先查询状态，不能自动重发可能已生效的操作。
 
 ## 全部 7 个群管理事件
 
@@ -121,9 +121,12 @@
 |---|---|---|
 | [群消息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html) | `POST /v2/groups/{g}/messages` | 文本 `msg_type=0`、Markdown `2`、富媒体 `7`、图文卡片 `8`；支持 `keyboard` |
 | [群消息撤回](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages_message_id.delete.html) | `DELETE /v2/groups/{g}/messages/{message_id}` | 2 分钟内；普通机器人可撤回自己的消息，管理员机器人还可撤回普通成员消息 |
+| @群成员 | Markdown 内容含 `<qqbot-at-user id="member_openid" />` | 群聊表仅声明支持 Markdown；ID 为被提及成员的群 OpenID |
 | @全体成员 | 文本或 Markdown 内容含 `<qqbot-at-everyone />` | 机器人须为群管理员；**每群每天仅 1 次**；仍受群消息配额约束 |
 
 消息详情页是撤回权限核验依据。部分概述旧文仍写「仅撤回机器人自己的消息」，与较新的专用撤回接口页存在差异，插件按专用接口说明处理，并由服务端判定最终权限。
+
+成员提及以[文本交互的群聊能力表](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/trans/text-chain.html)为准，不能将频道支持文本 @用户的规则套用到群聊。v1.3.0 的禁言、更新禁言和解禁成功回执使用单行 Markdown，无标题或按钮；其余写操作回复简短结果。群内错误只显示原因，接口诊断留在后台日志；详细操作记录通过 `/日志` 主动查询。
 
 ### 被动回复与配额
 
@@ -146,10 +149,6 @@
 - 原生 `markdown.content` 可配按钮；发送 Markdown 时顶层 `content` 必须为空。模板模式仍受平台模板权限约束，错误时应保留纯文本命令入口。
 
 以上字段直接来源于当前[群消息请求对象](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)，由服务端实际授权决定是否可用。
-
-## 客户端原生群指令面板
-
-v1.2 新增官方 `/v2/panels` 接口支持，可通过 `/设置菜单` 为当前 QQ 群安装 20 个常用短命令，`/菜单状态` 查询，`/移除菜单` 删除本插件在当前群的面板。原有 17 个群管理接口完整保留；新增的面板接口不使用单聊自定义菜单 `/v2/menu`。具体字段、平台限制及官方来源见 [原生指令菜单](COMMAND_MENU.md)。
 
 ## 不能冒充已支持的功能
 

@@ -36,9 +36,6 @@ ROUTE_TEMPLATES = frozenset(
         "/v2/groups/join_approval_strategy/{strategy_id}",
         "/v2/groups/join_approval_strategy/{strategy_id}/execute",
         "/v2/groups/join_approval_strategy/{strategy_id}/whitelist_users",
-        "/v2/panels",
-        "/v2/panels/{panel_id}",
-        "/v2/panels/{panel_id}/target",
         "/v2/groups/{group_openid}/messages",
         "/v2/groups/{group_openid}/messages/{message_id}",
     }
@@ -70,19 +67,21 @@ DIAGNOSTIC_FIELDS = frozenset(
     {
         "err_code",
         "code",
-        "records",
-        "records[].panel",
-        "records[].panel_id",
+        "members",
+        "members[].member_openid",
         "next_cursor",
-        "is_end",
-        "panel_id",
-        "scope",
-        "target_type",
-        "panel",
-        "panel.remark",
+        "member_openid",
+        "member_role",
+        "list",
+        "join_request_id",
+        "users",
+        "strategies",
+        "strategy_id",
         "group_openids",
-        "version",
-        "panel.items",
+        "global_rule",
+        "remove_members_result",
+        "add_to_member_blacklist_fail_openids",
+        "fail_openids",
     }
 )
 DIAGNOSTIC_VALUES = frozenset(
@@ -107,13 +106,12 @@ DIAGNOSTIC_VALUES = frozenset(
     }
 )
 RESPONSE_SHAPE_FIELDS = (
-    "records",
-    "is_end",
+    "members",
     "next_cursor",
     "data",
     "list",
-    "panels",
-    "items",
+    "users",
+    "strategies",
     "code",
     "err_code",
     "retcode",
@@ -123,12 +121,17 @@ RESPONSE_SHAPE_FIELDS = (
     "trace_id",
     "total",
     "count",
-    "panel_id",
-    "version",
-    "scope",
-    "target_type",
-    "panel",
+    "member_openid",
+    "member_role",
+    "bot",
     "group_openids",
+    "strategy_id",
+    "is_enable",
+    "expire_at",
+    "global_rule",
+    "remove_members_result",
+    "add_to_member_blacklist_fail_openids",
+    "fail_openids",
 )
 MAX_RESPONSE_SHAPE_LENGTH = 700
 
@@ -136,8 +139,8 @@ MAX_RESPONSE_SHAPE_LENGTH = 700
 def response_shape_parts(response: Mapping[str, Any] | None) -> tuple[str, ...] | None:
     """Snapshot only fixed field/type labels, never retain response values.
 
-    The two intentional value distinctions are pagination's boolean is_end
-    and whether a string cursor is empty. Only the root data object is entered.
+    A string cursor is classified as empty or nonempty without retaining it.
+    Only the root data object is entered; nested business data is never read.
     """
     if not isinstance(response, Mapping):
         return None
@@ -151,9 +154,7 @@ def response_shape_parts(response: Mapping[str, Any] | None) -> tuple[str, ...] 
             known += 1
             item = value[key]
             kind = "object" if isinstance(item, Mapping) else json_type(item) or "unknown"
-            if key == "is_end" and isinstance(item, bool):
-                kind = f"boolean({'true' if item else 'false'})"
-            elif key == "next_cursor" and isinstance(item, str):
+            if key == "next_cursor" and isinstance(item, str):
                 kind = f"string({'nonempty' if item else 'empty'})"
             elif key == "data" and isinstance(item, Mapping) and not item:
                 kind = "object{}"

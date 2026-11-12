@@ -11,6 +11,7 @@ from qq_admin.diagnostics import current_request_state
 from qq_admin.integration import EventContext
 from qq_admin.manager import AdminManager, duration_seconds
 from qq_admin.pagination import MAX_SNAPSHOT_CHARACTERS
+from qq_admin.panels import MemberMention
 from qq_admin.security import PermissionDenied
 from qq_admin.store import LocalStore
 
@@ -84,12 +85,35 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             ("通知 本周活动", "POST", "/v2/groups/group/messages"),
             ("全体通知 本周活动", "POST", "/v2/groups/group/messages"),
         ]
+        receipts = {
+            "移出": "已移出1名成员并拉黑",
+            "拉黑": "已拉黑1名成员",
+            "取消拉黑": "已取消拉黑1名成员",
+            "禁言": "已禁言 @target 10分钟",
+            "更新禁言": "已更新禁言 @target 60分钟",
+            "解禁": "已解禁 @target",
+            "同意": "已同意入群申请",
+            "拒绝": "已拒绝入群申请并拉黑",
+            "策略创建": "已创建策略，可用 /策略列表 查看",
+            "策略修改": "已修改策略",
+            "策略删除": "已删除策略",
+            "策略执行": "策略执行已提交，预计约10分钟完成",
+            "策略白名单": "已更新策略白名单",
+            "撤回": "已撤回消息",
+            "通知": "通知已发送",
+            "全体通知": "全体通知已发送",
+        }
         for index, (command, method, path) in enumerate(cases):
             with self.subTest(command=command):
                 self.transport.calls.clear()
+                self.transport.result = (
+                    {"remove_members_result": "success"} if command.startswith("移出 ") else {}
+                )
                 ctx = replace(self.ctx, message_id=f"message-{index}")
                 result = await self.manager.handle(ctx, command, self.api)
-                self.assertIn(result.title, {"操作已完成", "策略执行请求已受理"})
+                self.assertEqual(result.title, "")
+                self.assertEqual(result.buttons, [])
+                self.assertEqual(result.body, receipts[command.split()[0]])
                 self.assertEqual(len(self.transport.calls), 1)
                 self.assertEqual(self.transport.calls[0][:2], (method, path))
         log = await self.store.recent_audit(self.ctx, 20)
@@ -148,18 +172,10 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_old_confirmation_commands_do_not_execute_old_actions(self):
         for command in ("确认 old-token", "取消 old-token"):
             panel = await self.manager.handle(self.ctx, command, self.api)
-            self.assertEqual(panel.title, "旧指令已停用")
+            self.assertEqual(panel.body, "确认指令已停用，请直接发送管理命令。")
+            self.assertEqual(panel.title, "")
         self.assertEqual(self.transport.calls, [])
         self.assertEqual(await self.store.recent_audit(self.ctx), [])
-
-    async def test_native_menu_changes_require_astrbot_admin_and_current_group(self):
-        actor = replace(self.ctx, is_superuser=False)
-        for command in ("设置菜单", "移除菜单"):
-            with self.assertRaises(PermissionDenied):
-                await self.manager.handle(actor, command, self.api)
-            with self.assertRaises(ValueError):
-                await self.manager.handle(self.ctx, command + " another-group", self.api)
-        self.assertEqual(self.transport.calls, [])
 
     async def test_partial_blacklist_failure_is_visible_and_audited(self):
         self.transport.result = {
@@ -167,35 +183,72 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             "add_to_member_blacklist_fail_openids": ["target"],
         }
         panel = await self.manager.handle(self.ctx, "移出 target 拉黑", self.api)
-        self.assertEqual(panel.title, "部分操作未成功")
-        self.assertIn("target", panel.body)
-        self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "partial")
+        self.assertEqual(panel.title, "")
+        self.assertEqual(panel.body, "已移出1名成员，其中1名拉黑失败")
+        audit = (await self.store.recent_audit(self.ctx))[0]
+        self.assertEqual(audit["status"], "partial")
+        self.assertIn("拉黑失败：target", audit["detail"])
 
-    async def test_long_write_result_keeps_failure_details_on_later_pages(self):
-        self.transport.result = {"detail": "large reply " * 700, "fail_openids": ["failed-member"]}
-        panel = await self.manager.handle(self.ctx, "拉黑 target", self.api)
-        shown = panel.body
-        while next_button := next(
-            (button for button in panel.buttons if button.label == "下一段"), None
+    async def test_removal_requires_explicit_success_and_retains_deduplication(self):
+        for index, response in enumerate(
+            (
+                {},
+                {"detail": "unrelated field"},
+                {"remove_members_result": None},
+                {"remove_members_result": "failure"},
+                {"remove_members_result": []},
+            )
         ):
-            panel = await self.manager.handle(self.ctx, next_button.command, self.api)
-            shown += panel.body
-        self.assertIn("failed-member", shown)
+            with self.subTest(response=response):
+                self.transport.calls.clear()
+                self.transport.result = response
+                ctx = replace(self.ctx, message_id=f"incomplete-removal-{index}")
+                panel = await self.manager.handle(ctx, "移出 target", self.api)
+                self.assertEqual(panel.body, "结果未确认，请先查询状态。")
+                self.assertEqual((await self.store.recent_audit(ctx))[0]["status"], "unknown")
+                with self.assertRaises(ValueError):
+                    await self.manager.handle(ctx, "移出 target", self.api)
+                self.assertEqual(len(self.transport.calls), 1)
+
+    async def test_full_batch_failed_blacklist_ids_survive_audit_without_verbose_receipt(self):
+        members = [f"member{index:02d}" + "x" * 120 for index in range(20)]
+        self.transport.result = {
+            "remove_members_result": "success",
+            "add_to_member_blacklist_fail_openids": members,
+        }
+        panel = await self.manager.handle(self.ctx, "移出 " + ",".join(members) + " 拉黑", self.api)
+        self.assertEqual(panel.body, "已移出20名成员，其中20名拉黑失败")
+        audit = (await self.store.recent_audit(self.ctx))[0]
+        self.assertEqual(audit["status"], "partial")
+        for member in members:
+            self.assertIn(member, audit["detail"])
+
+    async def test_long_write_result_shows_only_success_count_and_failed_members(self):
+        self.transport.result = {"detail": "large reply " * 700, "fail_openids": ["failed-member"]}
+        panel = await self.manager.handle(self.ctx, "拉黑 target,failed-member", self.api)
+        self.assertEqual(panel.body, "已拉黑1名成员；失败成员：failed-member")
+        self.assertEqual(panel.buttons, [])
+        self.assertNotIn("large reply", panel.body)
         self.assertEqual(len(self.transport.calls), 1)
         self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "partial")
 
     async def test_oversize_success_result_does_not_claim_write_was_not_executed(self):
-        self.transport.result = {"detail": "x" * (MAX_SNAPSHOT_CHARACTERS + 1)}
+        self.transport.result = {
+            "remove_members_result": "success",
+            "detail": "x" * (MAX_SNAPSHOT_CHARACTERS + 1),
+        }
         panel = await self.manager.handle(self.ctx, "移出 target", self.api)
-        self.assertEqual(panel.title, "操作已完成")
-        self.assertIn("无法完整显示", panel.body)
+        self.assertEqual(panel.title, "")
+        self.assertEqual(panel.body, "已移出1名成员")
+        self.assertEqual(panel.buttons, [])
         self.assertEqual(len(self.transport.calls), 1)
         self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "success")
 
     async def test_timeout_is_unknown_and_request_cannot_be_retried(self):
         self.transport.failure = QQAPIError(0, "TIMEOUT", "request timeout")
         panel = await self.manager.handle(self.ctx, "移出 target", self.api)
-        self.assertEqual(panel.title, "操作结果尚未确认")
+        self.assertEqual(panel.title, "")
+        self.assertEqual(panel.body, "结果未确认，请先查询状态。")
         self.assertEqual(len(self.transport.calls), 1)
         with self.assertRaises(ValueError):
             await self.manager.handle(self.ctx, "移出 target", self.api)
@@ -210,8 +263,10 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mute_without_duration_immediately_executes_ten_minutes(self):
         panel = await self.manager.handle(self.ctx, "禁言 target", self.api)
-        self.assertIn("600 秒", panel.body)
-        self.assertEqual(panel.title, "操作已完成")
+        self.assertEqual(panel.body, "已禁言 @target 10分钟")
+        self.assertEqual(panel.title, "")
+        self.assertEqual(panel.buttons, [])
+        self.assertIn(MemberMention("target"), panel.content_parts)
         self.assertNotIn("/确认", panel.body)
         self.assertNotIn("/群管", panel.body)
         self.assertEqual(len(self.transport.calls), 1)
@@ -234,7 +289,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_success_http_status_with_invalid_body_is_still_uncertain(self):
         self.transport.failure = QQAPIError(200, "INVALID_RESPONSE", "invalid JSON")
         panel = await self.manager.handle(self.ctx, "移出 target", self.api)
-        self.assertEqual(panel.title, "操作结果尚未确认")
+        self.assertEqual(panel.body, "结果未确认，请先查询状态。")
         self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "unknown")
 
     async def test_success_headers_with_unreadable_body_are_still_uncertain(self):
@@ -244,134 +299,121 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.transport.failure = QQAPIError(201, code, "response body incomplete")
                 ctx = replace(self.ctx, message_id=f"body-{code}")
                 panel = await self.manager.handle(ctx, "移出 target", self.api)
-                self.assertEqual(panel.title, "操作结果尚未确认")
+                self.assertEqual(panel.body, "结果未确认，请先查询状态。")
                 self.assertEqual(len(self.transport.calls), 1)
                 self.assertEqual((await self.store.recent_audit(ctx))[0]["status"], "unknown")
 
     async def test_malformed_upstream_error_code_cannot_break_audit_failure_handling(self):
         self.transport.failure = QQAPIError(503, {"unexpected": "private-value"}, "opaque")
         panel = await self.manager.handle(self.ctx, "移出 target", self.api)
-        self.assertEqual(panel.title, "操作结果尚未确认")
+        self.assertEqual(panel.body, "结果未确认，请先查询状态。")
         self.assertNotIn("private-value", panel.body)
         self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "unknown")
 
-    async def test_menu_preflight_errors_never_claim_a_modification_was_attempted(self):
-        failures = [
-            QQAPIError(200, "INVALID_RESPONSE", "unsafe upstream message"),
-            QQAPIError(0, "TIMEOUT", "unsafe upstream message"),
-            QQAPIError(503, 503, "unsafe upstream message"),
-        ]
-        for command in ("设置菜单", "移除菜单"):
-            for index, failure in enumerate(failures):
-                with self.subTest(command=command, failure=failure.code):
-                    self.transport.calls.clear()
-                    self.transport.failure = failure
-                    ctx = replace(self.ctx, message_id=f"preflight-{command}-{index}")
-                    panel = await self.manager.handle(ctx, command, self.api)
-                    self.assertEqual(panel.title, "未执行操作")
-                    self.assertIn("未发送修改请求", panel.body)
-                    self.assertNotIn("操作结果尚未确认", panel.body)
-                    self.assertNotIn("unsafe upstream message", panel.body)
-                    self.assertEqual([call[0] for call in self.transport.calls], ["GET"])
-                    audit = (await self.store.recent_audit(ctx))[0]
-                    self.assertEqual(audit["status"], "failed")
-                    with self.assertRaises(ValueError):
-                        await self.manager.handle(ctx, command, self.api)
+    async def test_batch_mute_receipt_has_each_real_member_and_requested_duration(self):
+        panel = await self.manager.handle(self.ctx, "禁言 target,other 30m", self.api)
+        self.assertEqual(panel.body, "已禁言 @target @other 30分钟")
+        self.assertEqual(
+            [part for part in panel.content_parts if isinstance(part, MemberMention)],
+            [MemberMention("target"), MemberMention("other")],
+        )
+        self.assertEqual(panel.buttons, [])
+        self.assertEqual(len(self.transport.calls), 1)
 
-    async def test_menu_invalid_list_explains_field_without_creating_a_panel(self):
-        self.transport.result = {"records": None, "is_end": False, "next_cursor": "more"}
-        panel = await self.manager.handle(self.ctx, "设置菜单", self.api)
-        self.assertEqual(panel.title, "未执行操作")
-        self.assertTrue(panel.prefer_plain_text)
-        self.assertIn("/设置菜单", panel.body)
-        self.assertIn("GET /v2/panels", panel.body)
-        self.assertIn("records", panel.body)
-        self.assertIn("null", panel.body)
-        self.assertEqual([call[0] for call in self.transport.calls], ["GET"])
+    async def test_partial_mute_receipt_separates_succeeded_and_failed_members(self):
+        self.transport.result = {"fail_openids": ["other"]}
+        panel = await self.manager.handle(self.ctx, "禁言 target,other 10m", self.api)
+        self.assertEqual(panel.body, "已禁言 @target 10分钟\n禁言失败 @other")
+        self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "partial")
+
+    async def test_failure_for_an_unrequested_member_never_claims_success(self):
+        self.transport.result = {"fail_openids": ["unrequested"]}
+        panel = await self.manager.handle(self.ctx, "拉黑 target", self.api)
+        self.assertEqual(panel.body, "结果未确认，请先查询状态。")
+        self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "unknown")
+
+    async def test_all_member_failures_are_failed_not_partial_or_success(self):
+        self.transport.result = {"fail_openids": ["target", "other"]}
+        panel = await self.manager.handle(self.ctx, "禁言 target,other", self.api)
+        self.assertEqual(panel.body, "禁言失败 @target @other")
         self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "failed")
+
+    async def test_error_reply_is_short_but_audit_retains_diagnostic(self):
+        self.transport.failure = QQAPIError(
+            403, 11282, "private reason", "safe-trace", request_sent=True
+        )
+        panel = await self.manager.handle(self.ctx, "禁言 target", self.api)
+        self.assertEqual(panel.title, "")
+        self.assertEqual(panel.buttons, [])
+        self.assertNotIn("11282", panel.body)
+        self.assertNotIn("safe-trace", panel.body)
+        self.assertNotIn("private reason", panel.body)
+        self.assertNotIn("\n", panel.body)
+        audit = (await self.store.recent_audit(self.ctx))[0]
+        self.assertEqual(audit["status"], "failed")
+        self.assertIn("11282", audit["detail"])
+        self.assertIn("safe-trace", audit["detail"])
 
     async def test_cancellation_before_and_after_write_is_audited_separately(self):
         self.transport.failure = asyncio.CancelledError()
-        for command, status, method in (
-            ("设置菜单", "failed", "GET"),
-            ("移出 target", "unknown", "POST"),
+        self.transport.next_message_sequence = AsyncMock(side_effect=asyncio.CancelledError())
+        for command, status, methods in (
+            ("通知 活动", "failed", []),
+            ("移出 target", "unknown", ["POST"]),
         ):
             with self.subTest(command=command):
                 self.transport.calls.clear()
-                ctx = replace(self.ctx, message_id=f"cancel-{method}")
+                ctx = replace(self.ctx, message_id=f"cancel-{status}")
                 with self.assertRaises(asyncio.CancelledError):
                     await self.manager.handle(ctx, command, self.api)
                 self.assertEqual((await self.store.recent_audit(ctx))[0]["status"], status)
-                self.assertEqual([call[0] for call in self.transport.calls], [method])
+                self.assertEqual([call[0] for call in self.transport.calls], methods)
                 self.assertIsNone(current_request_state.get())
 
     async def test_internal_failure_before_and_after_write_does_not_expose_exception(self):
-        for command, status, title in (
-            ("设置菜单", "failed", "未执行操作"),
-            ("移出 target", "unknown", "操作结果尚未确认"),
+        failure = RuntimeError("private credential should never be shown")
+        self.transport.failure = failure
+        self.transport.next_message_sequence = AsyncMock(side_effect=failure)
+        for command, status, message in (
+            ("通知 活动", "failed", "处理失败，未执行操作。"),
+            ("移出 target", "unknown", "结果未确认，请先查询状态。"),
         ):
-            self.transport.failure = RuntimeError("private credential should never be shown")
             ctx = replace(self.ctx, message_id=f"exception-{status}")
             panel = await self.manager.handle(ctx, command, self.api)
-            self.assertEqual(panel.title, title)
+            self.assertEqual(panel.body, message)
             self.assertNotIn("private credential", panel.body)
             self.assertEqual((await self.store.recent_audit(ctx))[0]["status"], status)
             self.assertIsNone(current_request_state.get())
 
-    async def test_concurrent_menu_preflight_does_not_inherit_another_commands_write_state(self):
+    async def test_concurrent_commands_do_not_inherit_each_others_write_state(self):
         write_started = asyncio.Event()
         finish_write = asyncio.Event()
 
         async def request(method, path, **kwargs):
             self.transport.calls.append((method, path, kwargs))
-            if method == "POST":
-                write_started.set()
-                await finish_write.wait()
-                raise QQAPIError(0, "TIMEOUT", "write timeout")
+            write_started.set()
+            await finish_write.wait()
+            raise QQAPIError(0, "TIMEOUT", "write timeout")
+
+        async def sequence(*args):
             await write_started.wait()
-            return {"records": None, "is_end": False}
+            raise QQAPIError(0, "TRANSPORT_CLOSED", "private reason")
 
         self.transport.request = AsyncMock(side_effect=request)
+        self.transport.next_message_sequence = AsyncMock(side_effect=sequence)
         write_ctx = replace(self.ctx, message_id="concurrent-write")
-        menu_ctx = replace(self.ctx, message_id="concurrent-menu")
+        notice_ctx = replace(self.ctx, message_id="concurrent-notice")
         task = asyncio.create_task(self.manager.handle(write_ctx, "移出 target", self.api))
         try:
-            menu = await self.manager.handle(menu_ctx, "设置菜单", self.api)
+            notice = await self.manager.handle(notice_ctx, "通知 活动", self.api)
         finally:
             finish_write.set()
             write = await task
-        self.assertEqual(menu.title, "未执行操作")
-        self.assertEqual(write.title, "操作结果尚未确认")
+        self.assertTrue(notice.body.startswith("未执行："))
+        self.assertEqual(write.body, "结果未确认，请先查询状态。")
         audit = {row["action"]: row["status"] for row in await self.store.recent_audit(self.ctx)}
-        self.assertEqual(audit, {"设置菜单": "failed", "移出": "unknown"})
+        self.assertEqual(audit, {"通知": "failed", "移出": "unknown"})
         self.assertIsNone(current_request_state.get())
-
-    async def test_menu_failed_readback_keeps_original_write_uncertain(self):
-        results = iter(
-            [
-                {"records": [], "is_end": True, "next_cursor": ""},
-                {},
-                QQAPIError(0, "TIMEOUT", "readback failed", method="GET", request_sent=True),
-            ]
-        )
-
-        async def request(method, path, **kwargs):
-            self.transport.calls.append((method, path, kwargs))
-            result = next(results)
-            if isinstance(result, QQAPIError):
-                raise result
-            return result
-
-        self.transport.request = AsyncMock(side_effect=request)
-        panel = await self.manager.handle(self.ctx, "设置菜单", self.api)
-        self.assertEqual(panel.title, "操作结果尚未确认")
-        self.assertIn("/菜单状态", panel.body)
-        self.assertIn("INVALID_RESPONSE", panel.body)
-        self.assertIn("POST /v2/panels", panel.body)
-        self.assertEqual([call[0] for call in self.transport.calls], ["GET", "POST", "GET"])
-        self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "unknown")
-        with self.assertRaises(ValueError):
-            await self.manager.handle(self.ctx, "设置菜单", self.api)
 
     async def test_notice_reply_uses_current_button_event(self):
         click = replace(self.ctx, message_id="", event_id="INTERACTION_CREATE:new")
@@ -406,6 +448,55 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("同意 done_empty old_empty", commands)
         self.assertIn("同意 waiting new", commands)
         self.assertIn("入群 next", commands)
+
+    async def test_join_approval_buttons_keep_original_row_numbers_after_invalid_rows(self):
+        self.transport.result = {
+            "list": [
+                None,
+                {"member_openid": "first", "join_request_id": "request-1"},
+                {"member_openid": "second", "join_request_id": "request-2"},
+            ],
+        }
+        panel = await self.manager.handle(self.ctx, "入群", self.api)
+        self.assertIn("申请1：未返回完整申请信息", panel.body)
+        buttons = {button.label: button.command for button in panel.buttons}
+        self.assertNotIn("同意申请1", buttons)
+        self.assertEqual(buttons["同意申请2"], "同意 first request-1")
+        self.assertEqual(buttons["同意申请3"], "同意 second request-2")
+
+    async def test_malformed_join_list_has_a_short_query_error_without_approval_buttons(self):
+        for data in ({}, {"list": None}, {"list": 1}):
+            with self.subTest(data=data):
+                self.transport.result = data
+                panel = await self.manager.handle(self.ctx, "入群", self.api)
+                self.assertEqual(panel.body, "未返回入群申请列表。")
+                self.assertEqual(panel.buttons, [])
+
+    async def test_formatted_member_list_retains_every_record_and_next_api_page(self):
+        ids = [f"member-{index}-" + "a" * 110 for index in range(30)]
+        self.transport.result = {
+            "members": [
+                {"member_openid": member, "username": "成员", "member_role": "member"}
+                for member in ids
+            ],
+            "next_cursor": "NEXT_CURSOR",
+            "internal_detail": "private upstream value",
+        }
+        panel = await self.manager.handle(self.ctx, "成员", self.api)
+        shown = panel.body
+        while next_button := next(
+            (button for button in panel.buttons if button.label == "下一段"), None
+        ):
+            panel = await self.manager.handle(self.ctx, next_button.command, self.api)
+            shown += panel.body
+        for member in ids:
+            self.assertIn(member, shown)
+        self.assertIn("成员 NEXT_CURSOR", [button.command for button in panel.buttons])
+        self.assertNotIn("NEXT_CURSOR", shown)
+        self.assertNotIn("internal_detail", shown)
+        self.assertNotIn("private upstream value", shown)
+        self.assertNotIn("{", shown)
+        self.assertEqual(len(self.transport.calls), 1)
 
     async def test_missing_request_id_and_unknown_json_fields_reject_before_execution(self):
         for command in [

@@ -1,16 +1,20 @@
 import json
 import unittest
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 from qq_admin.panels import (
     MAX_MARKDOWN_LENGTH,
     ButtonSpec,
+    MemberMention,
     Panel,
     build_payload,
     escape_markdown,
     help_panel,
     home_panel,
+    render_plain_panel,
     result_panel,
+    text_reply,
 )
 
 
@@ -32,6 +36,89 @@ class PanelTests(unittest.TestCase):
         return [
             button for row in payload["keyboard"]["content"]["rows"] for button in row["buttons"]
         ]
+
+    def test_member_mentions_are_validated_and_immutable(self):
+        for value in ("target", "member_1-A", "123456789", "a" * 128):
+            with self.subTest(value=value):
+                mention = MemberMention(value)
+                self.assertEqual(mention.member_openid, value)
+                with self.assertRaises(FrozenInstanceError):
+                    mention.member_openid = "other-member"
+        for value in (
+            "",
+            "a" * 129,
+            "with space",
+            'id" /><qqbot-at-everyone />',
+            "id\n",
+            None,
+            123,
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                MemberMention(value)
+
+    def test_short_member_reply_is_one_line_markdown_with_no_heading_or_buttons(self):
+        panel = text_reply("已禁言 ", MemberMention("target-member"), " 10分钟")
+        self.assertEqual(panel.title, "")
+        self.assertEqual(panel.body, "已禁言 @target-member 10分钟")
+        self.assertEqual(panel.buttons, [])
+        self.assertTrue(panel.prefer_plain_text)
+        self.assertIsInstance(panel.content_parts, tuple)
+        payload = build_payload(panel, self.ctx, self.encode)
+        self.assertEqual(
+            payload,
+            {
+                "msg_type": 2,
+                "markdown": {"content": '已禁言 <qqbot-at-user id="target-member" /> 10分钟'},
+            },
+        )
+        self.assertEqual(self.encoded_calls, [])
+
+    def test_only_structured_mentions_can_create_qq_markup(self):
+        injected = (
+            '<qqbot-at-everyone /> <qqbot-at-user id="forged" /> <qqbot-cmd-enter text="/移出" />'
+        )
+        panel = text_reply(injected + " [link](https://invalid) ", MemberMention("real-member"))
+        payload = build_payload(panel, self.ctx, self.encode)
+        content = payload["markdown"]["content"]
+        self.assertEqual(content.count("<qqbot-"), 1)
+        self.assertIn('<qqbot-at-user id="real-member" />', content)
+        self.assertIn("&lt;qqbot", content)
+        self.assertIn("\\[link\\]", content)
+        plain = render_plain_panel(panel)
+        self.assertIn("@real-member", plain)
+        self.assertNotIn("<", plain)
+        self.assertNotIn(">", plain)
+        self.assertIn("＜qqbot-at-everyone /＞", plain)
+
+    def test_plain_reply_has_no_prefix_and_no_executable_tags(self):
+        self.assertEqual(
+            build_payload(text_reply("已完成"), self.ctx, self.encode),
+            {"msg_type": 0, "content": "已完成"},
+        )
+        self.assertEqual(render_plain_panel(Panel("", "已完成")), "已完成")
+        self.assertEqual(
+            render_plain_panel(text_reply("已禁言 ", MemberMention("m"), " 10分钟")),
+            "已禁言 @m 10分钟",
+        )
+        with self.assertRaises(ValueError):
+            text_reply({"member_openid": "forged"})
+        with self.assertRaises(ValueError):
+            render_plain_panel(Panel("", "", content_parts=({"member_openid": "forged"},)))
+
+    def test_twenty_maximum_length_mentions_fit_without_dropping_targets(self):
+        members = [MemberMention(f"{index:02d}" + "a" * 126) for index in range(20)]
+        parts = ["已禁言 "]
+        for index, member in enumerate(members):
+            if index:
+                parts.append(" ")
+            parts.append(member)
+        parts.append(" 10分钟")
+        payload = build_payload(text_reply(*parts), self.ctx, self.encode)
+        content = payload["markdown"]["content"]
+        self.assertEqual(content.count("<qqbot-at-user"), 20)
+        self.assertLessEqual(len(content), MAX_MARKDOWN_LENGTH)
+        self.assertNotIn("\n", content)
+        self.assertNotIn("keyboard", payload)
 
     def test_callback_is_bound_to_panel_owner_group_and_platform(self):
         panel = home_panel()
@@ -156,6 +243,17 @@ class PanelTests(unittest.TestCase):
         self.assertNotIn("/确认", help_message.body)
         self.assertNotIn("/取消", help_message.body.replace("/取消拉黑", ""))
         self.assertEqual(help_message.buttons[0].command, "菜单")
+        self.assertLessEqual(len(help_message.body.splitlines()), 12)
+        for topic in ("", "策略", "消息"):
+            panel = help_panel(topic)
+            build_payload(panel, self.ctx, self.encode)
+            self.assertLessEqual(len(panel.body.splitlines()), 12)
+            for removed in ("设置菜单", "菜单状态", "移除菜单"):
+                self.assertNotIn(removed, panel.body)
+        self.assertIn("/策略白名单", help_panel("策略").body)
+        self.assertIn("/撤回", help_panel("消息").body)
+        with self.assertRaises(ValueError):
+            help_panel("unknown")
         self.assertEqual(result_panel("操作结果", {}).buttons[0].command, "菜单")
         panel = result_panel("群成员", {"members": [], "next_cursor": ""}, buttons=[])
         self.assertIn("最后一页", panel.body)
