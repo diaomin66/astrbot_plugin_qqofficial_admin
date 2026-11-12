@@ -9,6 +9,7 @@ configuration is read-only through the public API.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -178,6 +179,63 @@ def _remark(value: Any) -> str:
     if len(value) > 255:
         raise ValueError("策略备注最多 255 个字符。")
     return value
+
+
+def _panel_text(value: Any, name: str, maximum: int, *, empty: bool = False) -> str:
+    text = _text(value, name, empty=empty)
+    # QQ documents 14 characters as approximately seven Chinese characters.
+    # Count full-width and wide Unicode characters as two display units.
+    width = sum(2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1 for char in text)
+    if width > maximum:
+        raise ValueError(f"{name}最多 {maximum} 个字符，中文等宽字符按 2 个计。")
+    return text
+
+
+def _panel_config(value: Any) -> dict[str, Any]:
+    """Validate only the documented native command-panel configuration.
+
+    A command item's name itself is inserted into QQ's input box. There is no
+    separate command/data/argument-template field and no group auto-send flag.
+    """
+    if not isinstance(value, Mapping) or set(value) - {"items", "remark", "version"}:
+        raise ValueError("panel 只支持 items、remark、version。")
+    items = _items(value.get("items"), "panel.items", 20)
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, Mapping) or set(item) - {
+            "name",
+            "desc",
+            "type",
+            "only_admin",
+            "link",
+        }:
+            raise ValueError("指令面板项只支持 name、desc、type、only_admin、link。")
+        kind = _choice(item.get("type"), {"command", "link"}, "panel.items.type")
+        entry: dict[str, Any] = {
+            "type": kind,
+            "name": _panel_text(item.get("name"), "panel.items.name", 14),
+        }
+        if "desc" in item:
+            entry["desc"] = _panel_text(item["desc"], "panel.items.desc", 30, empty=True)
+        if "only_admin" in item:
+            entry["only_admin"] = _bool(item["only_admin"], "panel.items.only_admin")
+        if kind == "link":
+            link = _text(item.get("link"), "panel.items.link")
+            if not re.fullmatch(r"https://[^\s/]+(?:/[^\s]*)?", link):
+                raise ValueError("指令面板 link 必须是有效的 HTTPS 链接。")
+            entry["link"] = link
+        elif "link" in item:
+            raise ValueError("command 类型不能包含 link 字段。")
+        normalized.append(entry)
+    config: dict[str, Any] = {"items": normalized}
+    if "remark" in value:
+        remark = _text(value["remark"], "panel.remark", empty=True)
+        if len(remark) > 255:
+            raise ValueError("指令面板备注最多 255 个字符。")
+        config["remark"] = remark
+    if "version" in value:
+        config["version"] = _integer(value["version"], "panel.version", 0, 2**31 - 1)
+    return config
 
 
 class QQGroupAPI:
@@ -417,6 +475,73 @@ class QQGroupAPI:
             + "/whitelist_users"
         )
         return await self._request("POST", path, json=payload)
+
+    async def list_panels(self, *, cursor: str = "", limit: int = 20) -> dict[str, Any]:
+        """List QQ group native command panels, never C2C menus or channels.
+
+        Response keys are records, next_cursor and is_end. Listing does not
+        provide the associated groups; use get_panel before changing targets.
+        """
+        params = {
+            "scope": "group",
+            "cursor": _text(cursor, "cursor", empty=True),
+            "limit": _integer(limit, "limit", 1, 50),
+        }
+        return await self._request("GET", "/v2/panels", params=params)
+
+    async def create_panel(
+        self, group_openids: Sequence[str], panel: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Create a native command panel for specified QQ groups.
+
+        Response: {"panel_id": "..."}. QQ permits at most twenty panels per
+        bot. Reuse an existing owned panel and add group targets rather than
+        creating another panel whenever the plugin starts or a user retries.
+        """
+        payload = {
+            "scope": "group",
+            "target_type": "specific",
+            "group_openids": _ids(group_openids, "group_openids", 20),
+            "panel": _panel_config(panel),
+        }
+        return await self._request("POST", "/v2/panels", json=payload)
+
+    async def get_panel(self, panel_id: str) -> dict[str, Any]:
+        """Get scope/target_type/panel/version and associated group_openids."""
+        return await self._request("GET", "/v2/panels/" + _segment(panel_id, "panel_id"))
+
+    async def update_panel(self, panel_id: str, panel: Mapping[str, Any]) -> dict[str, Any]:
+        """Replace items/remark while retaining targets; response has version."""
+        return await self._request(
+            "PUT",
+            "/v2/panels/" + _segment(panel_id, "panel_id"),
+            json={"panel": _panel_config(panel)},
+        )
+
+    async def delete_panel(self, panel_id: str) -> dict[str, Any]:
+        """Delete a panel for all its associated groups, returning an empty body.
+
+        To uninstall only the current group, remove its target association;
+        delete the whole panel only after verifying there are no other targets.
+        """
+        return await self._request("DELETE", "/v2/panels/" + _segment(panel_id, "panel_id"))
+
+    async def update_panel_groups(
+        self, panel_id: str, op: str, group_openids: Sequence[str]
+    ) -> dict[str, Any]:
+        """Add/remove up to twenty QQ group targets; response is empty.
+
+        Only existing group/specific panels support this operation. Callers
+        must verify ownership and scope from get_panel before mutating it.
+        """
+        return await self._request(
+            "PUT",
+            "/v2/panels/" + _segment(panel_id, "panel_id") + "/target",
+            json={
+                "op": _choice(op, {"add", "del"}, "op"),
+                "group_openids": _ids(group_openids, "group_openids", 20),
+            },
+        )
 
     async def send_message(self, group_openid: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Send documented group payloads, including native Markdown/keyboards.

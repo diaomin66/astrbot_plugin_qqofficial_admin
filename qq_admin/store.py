@@ -1,23 +1,14 @@
-"""持久化一次性确认与操作审计。SQLite 的事务同时防止并发双击与重放。"""
+"""持久化直接执行回执与操作审计，阻止事件重投和按钮连续点击。"""
 
 import asyncio
 import json
-import secrets
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
-@dataclass(frozen=True)
-class PendingAction:
-    token: str
-    action: str
-    params: dict[str, Any]
-    summary: str
-    expires_at: float
+RECEIPT_RETENTION_SECONDS = 24 * 60 * 60
 
 
 class LocalStore:
@@ -25,16 +16,12 @@ class LocalStore:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._db = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._db.row_factory = sqlite3.Row
         self.retention_days = min(365, max(1, retention_days))
         self._db.executescript("""
             PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS pending (
-                token TEXT PRIMARY KEY, platform TEXT NOT NULL, group_id TEXT NOT NULL,
-                actor TEXT NOT NULL, action TEXT NOT NULL, params TEXT NOT NULL,
-                summary TEXT NOT NULL, expires REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0
-            );
+            DROP TABLE IF EXISTS pending;
             CREATE TABLE IF NOT EXISTS audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL,
                 group_id TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
@@ -42,11 +29,17 @@ class LocalStore:
                 created REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS audit_scope ON audit(platform, group_id, created);
+            CREATE TABLE IF NOT EXISTS execution_receipts (
+                platform TEXT NOT NULL, group_id TEXT NOT NULL, actor TEXT NOT NULL,
+                request_key TEXT NOT NULL, audit_id INTEGER,
+                expires REAL NOT NULL,
+                PRIMARY KEY (platform, group_id, actor, request_key)
+            );
+            CREATE INDEX IF NOT EXISTS execution_receipts_expiry ON execution_receipts(expires);
         """)
-        self._db.execute("DELETE FROM pending WHERE expires<? OR used=1", (time.time(),))
-        self._db.execute(
-            "DELETE FROM audit WHERE created<?", (time.time() - self.retention_days * 86400,)
-        )
+        now = time.time()
+        self._db.execute("DELETE FROM execution_receipts WHERE expires<=?", (now,))
+        self._db.execute("DELETE FROM audit WHERE created<?", (now - self.retention_days * 86400,))
         self._db.execute(
             "UPDATE audit SET status='unknown',detail='插件重启，未确认最终结果，请查询官方状态。' "
             "WHERE status='executing'"
@@ -55,100 +48,64 @@ class LocalStore:
 
     @staticmethod
     def _scope(ctx: Any) -> tuple[str, str, str]:
-        return ctx.platform_id, ctx.group_id, ctx.user_id
+        scope = (ctx.platform_id, ctx.group_id, ctx.user_id)
+        if any(not isinstance(value, str) or not value.strip() for value in scope):
+            raise ValueError("缺少机器人、群或操作者身份，未执行操作。")
+        return scope
 
-    @staticmethod
-    def _pending(row: sqlite3.Row) -> PendingAction:
-        return PendingAction(
-            row["token"], row["action"], json.loads(row["params"]), row["summary"], row["expires"]
+    async def claim_execution(self, ctx: Any, request_key: str, action: str, params: dict) -> int:
+        """鉴权后原子登记一次执行；成功提交事务后调用方才可发送写请求。
+
+        同一平台、群、操作者及 request_key 在 24 小时内只返回一次 audit_id。
+        action 或 params 的变化不会允许同一请求再次执行。回执与审计共同提交，
+        即使进程在调用官方接口前后中断，也不能通过事件重投再次发起写操作。
+        """
+        scope = self._scope(ctx)
+        if (
+            not isinstance(request_key, str)
+            or not request_key.strip()
+            or len(request_key) > 2048
+            or any(ord(character) < 32 for character in request_key)
+        ):
+            raise ValueError("缺少有效的请求标识，未执行操作。请重新发送命令或打开面板。")
+        if not isinstance(action, str) or not action.strip():
+            raise ValueError("缺少操作类型，未执行操作。")
+        if not isinstance(params, dict):
+            raise ValueError("操作参数无效，未执行操作。")
+        audit_params = dict(params)
+        if "text" in audit_params:
+            # 执行使用调用方持有的原始参数；通知正文从不写入回执或审计。
+            audit_params["text"] = f"[正文 {len(str(audit_params['text']))} 字符]"
+        payload = json.dumps(
+            audit_params, ensure_ascii=False, allow_nan=False, separators=(",", ":")
         )
 
-    async def prepare(
-        self, ctx: Any, action: str, params: dict, summary: str, ttl: int = 120
-    ) -> PendingAction:
-        return await asyncio.to_thread(self._prepare, ctx, action, params, summary, ttl)
-
-    def _prepare(
-        self, ctx: Any, action: str, params: dict, summary: str, ttl: int
-    ) -> PendingAction:
-        now = time.time()
-        token = secrets.token_urlsafe(18)
-        expires = now + max(30, min(300, ttl))
-        payload = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
-        with self._lock, self._db:
-            self._db.execute("DELETE FROM pending WHERE expires < ?", (now,))
-            self._db.execute(
-                "DELETE FROM audit WHERE created < ?", (now - self.retention_days * 86400,)
-            )
-            count = self._db.execute(
-                "SELECT COUNT(*) FROM pending WHERE platform=? AND group_id=? AND actor=? AND used=0",
-                self._scope(ctx),
-            ).fetchone()[0]
-            if count >= 20:
-                raise ValueError("你有过多未确认的操作，请取消旧操作或等待确认过期。")
-            self._db.execute(
-                "INSERT INTO pending VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                (token, *self._scope(ctx), action, payload, summary, expires),
-            )
-        return PendingAction(token, action, params, summary, expires)
-
-    def _find(self, ctx: Any, token: str) -> sqlite3.Row:
-        row = self._db.execute(
-            "SELECT * FROM pending WHERE token=? AND platform=? AND group_id=? AND actor=?",
-            (token, *self._scope(ctx)),
-        ).fetchone()
-        if row is None or row["used"] or row["expires"] <= time.time():
-            raise ValueError("确认已过期、已处理或不属于当前操作者。请重新发起操作。")
-        return row
-
-    async def peek(self, ctx: Any, token: str) -> PendingAction:
-        def read():
-            with self._lock:
-                return self._pending(self._find(ctx, token))
-
-        return await asyncio.to_thread(read)
-
-    async def cancel(self, ctx: Any, token: str) -> None:
-        def write():
+        def write() -> int:
             with self._lock, self._db:
-                self._find(ctx, token)
-                result = self._db.execute(
-                    "DELETE FROM pending WHERE token=? AND used=0 AND expires>?",
-                    (token, time.time()),
+                now = time.time()
+                self._db.execute("DELETE FROM execution_receipts WHERE expires<=?", (now,))
+                receipt = self._db.execute(
+                    "INSERT INTO execution_receipts(platform,group_id,actor,request_key,expires) "
+                    "VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(platform,group_id,actor,request_key) DO NOTHING",
+                    (*scope, request_key, now + RECEIPT_RETENTION_SECONDS),
                 )
-                if result.rowcount != 1:
-                    raise ValueError("该操作已经处理或已过期，不能再取消。")
-
-        await asyncio.to_thread(write)
-
-    async def claim(self, ctx: Any, token: str) -> tuple[PendingAction, int]:
-        """调用方先重新鉴权，再原子消费令牌并写入执行中审计记录。"""
-
-        def write():
-            with self._lock, self._db:
-                row = self._find(ctx, token)
-                result = self._db.execute(
-                    "UPDATE pending SET used=1 WHERE token=? AND used=0 AND expires>?",
-                    (token, time.time()),
-                )
-                if result.rowcount != 1:
-                    raise ValueError("该操作已经处理或已过期。")
-                params = json.loads(row["params"])
-                # 通知正文仅用于待确认执行，不长期进入操作日志。
-                if "text" in params:
-                    params["text"] = f"[正文 {len(params['text'])} 字符]"
+                if receipt.rowcount != 1:
+                    raise ValueError(
+                        "这条命令或按钮已经处理，不会重复执行。请先查询操作日志或实际状态。"
+                    )
                 cursor = self._db.execute(
                     "INSERT INTO audit(platform,group_id,actor,action,params,status,created) "
                     "VALUES(?,?,?,?,?,'executing',?)",
-                    (
-                        *self._scope(ctx),
-                        row["action"],
-                        json.dumps(params, ensure_ascii=False),
-                        time.time(),
-                    ),
+                    (*scope, action, payload, now),
                 )
-                self._db.execute("DELETE FROM pending WHERE token=?", (token,))
-                return self._pending(row), int(cursor.lastrowid)
+                audit_id = int(cursor.lastrowid)
+                self._db.execute(
+                    "UPDATE execution_receipts SET audit_id=? "
+                    "WHERE platform=? AND group_id=? AND actor=? AND request_key=?",
+                    (audit_id, *scope, request_key),
+                )
+                return audit_id
 
         return await asyncio.to_thread(write)
 
@@ -190,7 +147,7 @@ class LocalStore:
         def write():
             with self._lock, self._db:
                 now = time.time()
-                self._db.execute("DELETE FROM pending WHERE expires<? OR used=1", (now,))
+                self._db.execute("DELETE FROM execution_receipts WHERE expires<=?", (now,))
                 self._db.execute(
                     "DELETE FROM audit WHERE created<?", (now - self.retention_days * 86400,)
                 )

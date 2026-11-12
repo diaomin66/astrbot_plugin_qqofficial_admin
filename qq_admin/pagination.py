@@ -145,7 +145,7 @@ class ResultPager:
             text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
         if len(text) > MAX_SNAPSHOT_CHARACTERS:
             raise ValueError("本次结果过大，无法完整显示；请缩小查询范围或使用成员详情")
-        base_buttons = tuple(buttons) if buttons is not None else (ButtonSpec("返回面板", "面板"),)
+        base_buttons = tuple(buttons) if buttons is not None else (ButtonSpec("返回菜单", "菜单"),)
         if len(base_buttons) > 10:
             raise ValueError("结果分页每段最多附带 10 个操作按钮")
 

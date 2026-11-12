@@ -10,6 +10,10 @@ from .integration import MENTION_MARKUP, MentionContext, _field, mention_context
 DIRECT_COMMANDS = frozenset(
     {
         "面板",
+        "菜单",
+        "设置菜单",
+        "菜单状态",
+        "移除菜单",
         "帮助",
         "help",
         "身份",

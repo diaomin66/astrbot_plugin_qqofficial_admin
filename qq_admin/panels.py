@@ -3,19 +3,20 @@
 Panel titles and bodies are plain text. They are escaped at the final rendering
 boundary, including QQ's XML-like mention and command tags. Callback payloads
 carry their original context, but the command handler must still authorize the
-actual event and validate any confirmation token before making a change.
+actual event and deduplicate the operation before making a change.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 # A conservative presentation budget, not an assertion about QQ's API limit.
-# Oversized confirmation panels fail explicitly rather than hiding their target.
+# Oversized panels fail explicitly rather than silently hiding their content.
 MAX_MARKDOWN_LENGTH = 3800
 MAX_BUTTONS = 25
 BUTTONS_PER_ROW = 3
@@ -76,7 +77,7 @@ def build_payload(
     """
     content = _markdown_content(panel)
     if len(content) > MAX_MARKDOWN_LENGTH:
-        raise ValueError("面板内容过长，请拆分显示；确认操作的详情不能被截断")
+        raise ValueError("菜单内容过长，请拆分显示；操作详情不能被截断")
     if len(panel.buttons) > MAX_BUTTONS:
         raise ValueError("单个面板最多 25 个按钮，请分页显示")
     if panel.buttons and not all((ctx.platform_id, ctx.group_id, ctx.user_id)):
@@ -106,6 +107,7 @@ def build_payload(
                     "platform_id": ctx.platform_id,
                     "group_id": ctx.group_id,
                     "owner_id": ctx.user_id,
+                    "operation_id": secrets.token_urlsafe(18),
                 },
             )
         else:
@@ -120,14 +122,6 @@ def build_payload(
             },
             "action": action,
         }
-        if spec.danger:
-            action["modal"] = {
-                "content": f"确认执行“{spec.label}”？请核对上方操作详情。",
-                "confirm_text": "确认",
-                "cancel_text": "取消",
-            }
-            if spec.kind == "callback":
-                button["group_id"] = "qqadmin_danger"
         buttons.append(button)
 
     payload: dict[str, Any] = {"msg_type": 2, "markdown": {"content": content}}
@@ -148,19 +142,30 @@ def build_payload(
 
 def home_panel() -> Panel:
     return Panel(
-        title="QQ 群管理",
+        title="群管理菜单",
         body=(
-            "选择需要查看的内容。按钮仅供打开此面板的用户操作。\n"
-            "管理操作会再次校验当前群身份；入群策略仅限机器人超级管理员。\n"
-            "也可以直接发送 /禁言 @成员 10m、/解禁 @成员。更多命令见 /帮助。"
+            "点击管理指令，补全 @成员、时长或内容后发送，即可执行。\n"
+            "例如：/禁言 @成员 10m；不填时长默认 10 分钟。请在 QQ 中选择真实成员。\n"
+            "查询按钮直接查看结果。按钮仅供打开菜单的用户操作，管理功能按当前权限执行。"
         ),
         buttons=[
+            ButtonSpec("禁言", "禁言 ", "input"),
+            ButtonSpec("解禁", "解禁 ", "input"),
+            ButtonSpec("移出成员", "移出 ", "input", danger=True),
+            ButtonSpec("成员详情", "成员详情 ", "input"),
+            ButtonSpec("发送通知", "通知 ", "input"),
+            ButtonSpec("全体通知", "全体通知 ", "input", danger=True),
+            ButtonSpec("更新禁言", "更新禁言 ", "input"),
+            ButtonSpec("加入黑名单", "拉黑 ", "input", danger=True),
+            ButtonSpec("取消拉黑", "取消拉黑 ", "input"),
+            ButtonSpec("群成员", "成员"),
+            ButtonSpec("入群申请", "入群"),
+            ButtonSpec("群黑名单", "黑名单"),
+            ButtonSpec("禁言状态", "禁言状态"),
             ButtonSpec("群信息", "信息"),
             ButtonSpec("机器人状态", "状态"),
-            ButtonSpec("群成员", "成员"),
-            ButtonSpec("禁言状态", "禁言状态"),
-            ButtonSpec("群黑名单", "黑名单"),
-            ButtonSpec("入群申请", "入群"),
+            ButtonSpec("最近消息", "最近消息"),
+            ButtonSpec("操作日志", "日志"),
             ButtonSpec("入群策略", "策略列表"),
             ButtonSpec("我的身份", "身份"),
             ButtonSpec("使用帮助", "帮助"),
@@ -170,13 +175,16 @@ def home_panel() -> Panel:
 
 def help_panel() -> Panel:
     return Panel(
-        title="群管使用帮助",
+        title="管理指令帮助",
         body=(
-            "直接使用下方短命令，无需添加前缀。请在 QQ 中选择真实的 @成员。\n"
+            "发送 /菜单 打开消息快捷菜单；点击管理指令，补全参数后发送即执行。\n"
+            "由 AstrBot 管理员发送 /设置菜单 安装 QQ 客户端原生指令面板。\n"
+            "也可直接发送下方短命令，查询与审批按钮点击后直接处理。请在 QQ 中选择真实的 @成员。\n"
             "若机器人只能接收 @它的消息，请同时 @机器人；机器人自身不会作为操作目标。\n"
             "成员目标也可填写 /成员 中的 OpenID；多个 OpenID 用逗号分隔。策略白名单使用 QQ 号。\n\n"
             "查看信息\n"
-            "/面板｜/帮助｜/身份｜/信息｜/状态\n"
+            "/菜单｜/帮助｜/身份｜/信息｜/状态\n"
+            "/菜单状态\n"
             "/成员 [cursor]\n"
             "/成员详情 @成员\n"
             "/禁言状态\n"
@@ -197,7 +205,8 @@ def help_panel() -> Panel:
             "/同意 member request\n"
             "/拒绝 member request [reason]\n"
             "member 与 request 请从待处理入群申请中获取。\n\n"
-            "入群策略（机器人超级管理员）\n"
+            "菜单设置与入群策略（AstrBot 管理员）\n"
+            "/设置菜单｜/移除菜单\n"
             "/策略列表 [cursor]\n"
             "/策略创建 JSON\n"
             "/策略修改 id JSON\n"
@@ -210,11 +219,9 @@ def help_panel() -> Panel:
             "/全体通知 text\n"
             "撤回限 2 分钟内；撤回普通成员消息要求机器人是群管理员。\n"
             "全体通知要求机器人是群管理员，每群每个自然日限 1 次。\n\n"
-            "涉及修改的操作请核对确认面板；按钮不可用时发送：\n"
-            "/确认 token\n"
-            "/取消 token"
+            "命令参数完整并通过权限检查后直接执行。按钮不可用时可直接发送对应命令。"
         ),
-        buttons=[ButtonSpec("返回面板", "面板"), ButtonSpec("我的身份", "身份")],
+        buttons=[ButtonSpec("返回菜单", "菜单"), ButtonSpec("我的身份", "身份")],
     )
 
 
@@ -243,9 +250,9 @@ def result_panel(
 ) -> Panel:
     """Present an API result and retain pagination information after truncation.
 
-    Only read/result data is abbreviated. Construct a plain ``Panel`` for a
-    confirmation so its full operation and targets are either sent or rejected.
-    A caller may pass pagination buttons containing the unmodified cursor.
+    Only read/result data is abbreviated. Construct a plain ``Panel`` when the
+    full details must be sent or rejected. A caller may pass pagination buttons
+    containing the unmodified cursor.
     """
     if data is None:
         text = "操作已完成。"
@@ -281,5 +288,5 @@ def result_panel(
     return Panel(
         title=title,
         body=body,
-        buttons=list(buttons) if buttons is not None else [ButtonSpec("返回面板", "面板")],
+        buttons=list(buttons) if buttons is not None else [ButtonSpec("返回菜单", "菜单")],
     )

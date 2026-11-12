@@ -125,6 +125,14 @@ class BotpyTransport:
         self._sequences: OrderedDict[tuple[str, str], tuple[int, float]] = OrderedDict()
         self._closed = False
 
+    @property
+    def application_id(self) -> str:
+        """Identify one bot across WebSocket and webhook adapter instances."""
+        api = getattr(self.bot, "api", None)
+        http = getattr(api, "_http", None) or getattr(self.bot, "http", None)
+        token = getattr(http, "_token", None)
+        return str(getattr(token, "app_id", "") or "")
+
     async def _headers(self) -> dict[str, str]:
         api = getattr(self.bot, "api", None)
         http = getattr(api, "_http", None) or getattr(self.bot, "http", None)

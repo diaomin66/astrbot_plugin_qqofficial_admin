@@ -1,5 +1,6 @@
 """所有入口共用的服务端鉴权，不信任按钮客户端 permission。"""
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -24,7 +25,7 @@ class AccessControl:
         if ctx.is_superuser:
             return
         if global_operation:
-            raise PermissionDenied("自动审批策略作用于整台机器人，仅 AstrBot 管理员可以操作。")
+            raise PermissionDenied("此操作涉及机器人级资源，仅 AstrBot 管理员可以操作。")
         identity = f"{ctx.platform_id}|{ctx.group_id}|{ctx.user_id}"
         if identity in self.config.get("trusted_admins", []):
             return
@@ -44,15 +45,23 @@ class AccessControl:
     @staticmethod
     def verify_button(ctx: Any, data: Any) -> str:
         if not isinstance(data, dict):
-            raise PermissionDenied("按钮数据无效，请重新发送 /面板。")
+            raise PermissionDenied("按钮数据无效，请重新发送 /菜单。")
         expected = {
             "platform_id": ctx.platform_id,
             "group_id": ctx.group_id,
             "owner_id": ctx.user_id,
         }
         if any(data.get(key) != value for key, value in expected.items()):
-            raise PermissionDenied("该面板属于其他操作者或群，请发送 /面板 创建自己的面板。")
+            raise PermissionDenied("该菜单属于其他操作者或群，请发送 /菜单 创建自己的菜单。")
         command = data.get("command")
         if not isinstance(command, str) or not command or len(command) > 16000:
-            raise PermissionDenied("按钮指令无效，请重新发送 /面板。")
+            raise PermissionDenied("按钮指令无效，请重新发送 /菜单。")
         return command
+
+    @staticmethod
+    def button_request_key(data: Any) -> str:
+        """A stable per-button key prevents repeated writes; it grants no access."""
+        value = data.get("operation_id") if isinstance(data, dict) else None
+        if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value) is None:
+            raise PermissionDenied("此操作按钮已过期，请重新发送 /菜单 后选择操作。")
+        return "button:" + value

@@ -165,6 +165,7 @@ def button_data(**changes):
         "platform_id": "adapter-1",
         "group_id": "group-1",
         "owner_id": "member-1",
+        "operation_id": "unique-operation-12345",
     }
     data.update(changes)
     return data
@@ -228,7 +229,7 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_alias_and_native_callback_are_registered_at_high_priority(self):
         command = self.handler("command")
         record = next(item for item in command._contract_filters if item[0] == "command")
-        self.assertEqual(record[1], ("面板",))
+        self.assertEqual(record[1], ("菜单",))
         self.assertTrue({"禁言", "解禁", "移出", "帮助", "确认", "群管"} <= record[2]["alias"])
         self.assertIn("qqadmin", record[2]["alias"])
         self.assertNotIn("help", record[2]["alias"])
@@ -292,7 +293,7 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.stopped)
         self.sender.assert_awaited_once()
 
-    async def test_direct_mention_command_executes_only_selected_members_after_button_confirmation(
+    async def test_direct_mention_command_immediately_executes_only_selected_members(
         self,
     ):
         manager = self.plugin._manager
@@ -308,17 +309,9 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.plugin, "_deliver", wraps=self.plugin._deliver) as deliver:
             await self.handler("command")(event)
             panel = deliver.await_args.args[1]
-            self.assertEqual(panel.title, "请确认管理操作")
+            self.assertEqual(panel.title, "操作已完成")
             self.assertIn("600 秒", panel.body)
             self.assertNotIn("robot-member", panel.body)
-            transport.request.assert_not_awaited()
-            confirmation = panel.buttons[0].command
-            click = FakeEvent(
-                interaction=SimpleNamespace(
-                    action_id="qqadmin", data=button_data(command=confirmation)
-                )
-            )
-            await self.handler("button_action")(click)
             transport.request.assert_awaited_once()
             request = transport.request.await_args
             self.assertEqual(request.args, ("POST", "/v2/groups/group-1/restrict_chat_setting"))
@@ -330,8 +323,66 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(member["op"], "add")
                 expiry = datetime.fromisoformat(member["mute_expire_at"])
                 self.assertTrue(595 < (expiry - datetime.now(UTC)).total_seconds() <= 600)
-            await self.handler("button_action")(click)
+            await self.handler("command")(event)
             transport.request.assert_awaited_once()
+
+    async def test_native_operation_button_executes_once_without_confirmation(self):
+        manager = self.plugin._manager
+        manager.handle = type(manager).handle.__get__(manager)
+        transport = SimpleNamespace(request=AsyncMock(return_value={}))
+        self.plugin._transport = AsyncMock(return_value=transport)
+        data = button_data(command="禁言 target-member 10m")
+        for index in range(2):
+            event = FakeEvent(interaction=SimpleNamespace(action_id="qqadmin", data=data))
+            event.message_obj.raw_message.event_id = f"INTERACTION_CREATE:{index}"
+            with patch.object(self.plugin, "_deliver", wraps=self.plugin._deliver) as deliver:
+                await self.handler("button_action")(event)
+                self.assertEqual(
+                    deliver.await_args.args[1].title, "操作已完成" if index == 0 else "未执行操作"
+                )
+            transport.request.assert_awaited_once()
+        self.assertEqual(
+            transport.request.await_args.kwargs["json"]["members"][0]["member_openid"],
+            "target-member",
+        )
+
+    async def test_old_write_buttons_and_stale_messages_do_not_execute(self):
+        data = button_data(command="移出 target")
+        data.pop("operation_id")
+        old_button = FakeEvent(interaction=SimpleNamespace(action_id="qqadmin", data=data))
+        await self.handler("button_action")(old_button)
+        self.plugin._manager.handle.assert_not_awaited()
+        event = FakeEvent("/禁言 <@target>")
+        event.message_obj.raw_message.timestamp = time.time() - 301
+        await self.handler("command")(event)
+        self.plugin._manager.handle.assert_not_awaited()
+
+    async def test_setup_menu_command_creates_native_group_panel_without_confirmation(self):
+        manager = self.plugin._manager
+        manager.handle = type(manager).handle.__get__(manager)
+        transport = SimpleNamespace(
+            request=AsyncMock(
+                side_effect=[
+                    {"records": [], "next_cursor": "", "is_end": True},
+                    {"panel_id": "native-panel-1"},
+                ]
+            )
+        )
+        self.plugin._transport = AsyncMock(return_value=transport)
+        event = FakeEvent("/设置菜单")
+        await self.handler("command")(event)
+        self.assertEqual(transport.request.await_count, 2)
+        listed, created = transport.request.await_args_list
+        self.assertEqual(listed.args, ("GET", "/v2/panels"))
+        self.assertEqual(listed.kwargs["params"]["scope"], "group")
+        self.assertEqual(created.args, ("POST", "/v2/panels"))
+        body = created.kwargs["json"]
+        self.assertEqual(body["group_openids"], ["group-1"])
+        self.assertEqual(body["target_type"], "specific")
+        self.assertEqual(len(body["panel"]["items"]), 20)
+        self.assertIn("/禁言", [item["name"] for item in body["panel"]["items"]])
+        await self.handler("command")(event)
+        self.assertEqual(transport.request.await_count, 2)
 
     async def test_command_and_callback_ignore_non_qq_groups_and_guild_channels(self):
         for kind in ("command", "button_action"):
@@ -440,7 +491,7 @@ class EntrypointTests(unittest.IsolatedAsyncioTestCase):
         entered = asyncio.Event()
         finish = asyncio.Event()
 
-        async def delayed_result(*args):
+        async def delayed_result(*args, **kwargs):
             entered.set()
             await finish.wait()
             return Panel("完成", "已处理")

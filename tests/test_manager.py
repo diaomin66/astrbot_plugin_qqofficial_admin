@@ -8,6 +8,7 @@ from pathlib import Path
 from qq_admin.api import QQAPIError, QQGroupAPI
 from qq_admin.integration import EventContext
 from qq_admin.manager import AdminManager, duration_seconds
+from qq_admin.pagination import MAX_SNAPSHOT_CHARACTERS
 from qq_admin.security import PermissionDenied
 from qq_admin.store import LocalStore
 
@@ -46,12 +47,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.store.close()
         self.directory.cleanup()
 
-    async def prepare(self, text, ctx=None):
-        panel = await self.manager.handle(ctx or self.ctx, text, self.api)
-        self.assertEqual(panel.title, "请确认管理操作")
-        return panel.buttons[0].command
-
-    async def test_each_mutation_is_reviewed_then_calls_correct_official_endpoint(self):
+    async def test_each_mutation_directly_calls_correct_official_endpoint(self):
         cases = [
             ("移出 target 拉黑", "POST", "/v2/groups/group/batch_remove_members"),
             ("拉黑 target", "POST", "/v2/groups/group/member_blacklist"),
@@ -86,12 +82,11 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             ("通知 本周活动", "POST", "/v2/groups/group/messages"),
             ("全体通知 本周活动", "POST", "/v2/groups/group/messages"),
         ]
-        for command, method, path in cases:
+        for index, (command, method, path) in enumerate(cases):
             with self.subTest(command=command):
                 self.transport.calls.clear()
-                confirmation = await self.prepare(command)
-                self.assertEqual(self.transport.calls, [], "Preparing must not change QQ state")
-                result = await self.manager.handle(self.ctx, confirmation, self.api)
+                ctx = replace(self.ctx, message_id=f"message-{index}")
+                result = await self.manager.handle(ctx, command, self.api)
                 self.assertIn(result.title, {"操作已完成", "策略执行请求已受理"})
                 self.assertEqual(len(self.transport.calls), 1)
                 self.assertEqual(self.transport.calls[0][:2], (method, path))
@@ -99,12 +94,12 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(log), len(cases))
         self.assertTrue(all(row["status"] == "success" for row in log))
 
-    async def test_fresh_role_check_blocks_revoked_admin_at_confirmation(self):
+    async def test_fresh_role_check_blocks_revoked_admin_after_viewing_member(self):
         actor = replace(self.ctx, is_superuser=False)
-        confirmation = await self.prepare("移出 target", actor)
+        await self.manager.handle(actor, "成员详情 target", self.api)
         self.transport.role = "member"
         with self.assertRaises(PermissionDenied):
-            await self.manager.handle(actor, confirmation, self.api)
+            await self.manager.handle(actor, "移出 target", self.api)
         self.assertTrue(all(call[0] == "GET" for call in self.transport.calls))
         self.assertEqual(await self.store.recent_audit(actor), [])
 
@@ -114,51 +109,110 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             await self.manager.handle(actor, "策略删除 strategy", self.api)
         self.assertEqual(self.transport.calls, [])
 
-    async def test_repeated_confirmations_execute_once(self):
-        confirmation = await self.prepare("移出 target")
+    async def test_repeated_message_deliveries_execute_once(self):
         results = await asyncio.gather(
-            *(self.manager.handle(self.ctx, confirmation, self.api) for _ in range(12)),
+            *(self.manager.handle(self.ctx, "移出 target", self.api) for _ in range(12)),
             return_exceptions=True,
         )
         self.assertEqual(sum(not isinstance(value, Exception) for value in results), 1)
         self.assertEqual(len(self.transport.calls), 1)
 
+    async def test_new_messages_can_intentionally_repeat_the_same_command(self):
+        for message_id in ("message-1", "message-2"):
+            await self.manager.handle(
+                replace(self.ctx, message_id=message_id), "禁言 target", self.api
+            )
+        self.assertEqual(len(self.transport.calls), 2)
+
+    async def test_same_button_on_distinct_click_events_executes_once(self):
+        for index in range(2):
+            click = replace(self.ctx, message_id="", event_id=f"INTERACTION_CREATE:{index}")
+            if index == 0:
+                await self.manager.handle(
+                    click, "移出 target", self.api, request_key="button:fixed-operation-id"
+                )
+            else:
+                with self.assertRaises(ValueError):
+                    await self.manager.handle(
+                        click, "移出 target", self.api, request_key="button:fixed-operation-id"
+                    )
+        self.assertEqual(len(self.transport.calls), 1)
+
+    async def test_missing_event_identity_never_executes_write(self):
+        with self.assertRaises(ValueError):
+            await self.manager.handle(replace(self.ctx, message_id=""), "移出 target", self.api)
+        self.assertEqual(self.transport.calls, [])
+
+    async def test_old_confirmation_commands_do_not_execute_old_actions(self):
+        for command in ("确认 old-token", "取消 old-token"):
+            panel = await self.manager.handle(self.ctx, command, self.api)
+            self.assertEqual(panel.title, "旧指令已停用")
+        self.assertEqual(self.transport.calls, [])
+        self.assertEqual(await self.store.recent_audit(self.ctx), [])
+
+    async def test_native_menu_changes_require_astrbot_admin_and_current_group(self):
+        actor = replace(self.ctx, is_superuser=False)
+        for command in ("设置菜单", "移除菜单"):
+            with self.assertRaises(PermissionDenied):
+                await self.manager.handle(actor, command, self.api)
+            with self.assertRaises(ValueError):
+                await self.manager.handle(self.ctx, command + " another-group", self.api)
+        self.assertEqual(self.transport.calls, [])
+
     async def test_partial_blacklist_failure_is_visible_and_audited(self):
-        confirmation = await self.prepare("移出 target 拉黑")
         self.transport.result = {
             "remove_members_result": "success",
             "add_to_member_blacklist_fail_openids": ["target"],
         }
-        panel = await self.manager.handle(self.ctx, confirmation, self.api)
+        panel = await self.manager.handle(self.ctx, "移出 target 拉黑", self.api)
         self.assertEqual(panel.title, "部分操作未成功")
         self.assertIn("target", panel.body)
         self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "partial")
 
-    async def test_timeout_is_unknown_and_token_cannot_be_retried(self):
-        confirmation = await self.prepare("移出 target")
+    async def test_long_write_result_keeps_failure_details_on_later_pages(self):
+        self.transport.result = {"detail": "large reply " * 700, "fail_openids": ["failed-member"]}
+        panel = await self.manager.handle(self.ctx, "拉黑 target", self.api)
+        shown = panel.body
+        while next_button := next(
+            (button for button in panel.buttons if button.label == "下一段"), None
+        ):
+            panel = await self.manager.handle(self.ctx, next_button.command, self.api)
+            shown += panel.body
+        self.assertIn("failed-member", shown)
+        self.assertEqual(len(self.transport.calls), 1)
+        self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "partial")
+
+    async def test_oversize_success_result_does_not_claim_write_was_not_executed(self):
+        self.transport.result = {"detail": "x" * (MAX_SNAPSHOT_CHARACTERS + 1)}
+        panel = await self.manager.handle(self.ctx, "移出 target", self.api)
+        self.assertEqual(panel.title, "操作已完成")
+        self.assertIn("无法完整显示", panel.body)
+        self.assertEqual(len(self.transport.calls), 1)
+        self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "success")
+
+    async def test_timeout_is_unknown_and_request_cannot_be_retried(self):
         self.transport.failure = QQAPIError(0, "TIMEOUT", "request timeout")
-        panel = await self.manager.handle(self.ctx, confirmation, self.api)
+        panel = await self.manager.handle(self.ctx, "移出 target", self.api)
         self.assertEqual(panel.title, "操作结果尚未确认")
         self.assertEqual(len(self.transport.calls), 1)
         with self.assertRaises(ValueError):
-            await self.manager.handle(self.ctx, confirmation, self.api)
+            await self.manager.handle(self.ctx, "移出 target", self.api)
         self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "unknown")
 
     async def test_member_mute_expiry_is_calculated_from_execution(self):
-        confirmation = await self.prepare("禁言 target 10m")
-        await self.manager.handle(self.ctx, confirmation, self.api)
+        await self.manager.handle(self.ctx, "禁言 target 10m", self.api)
         body = self.transport.calls[0][2]
         expires = datetime.fromisoformat(body["members"][0]["mute_expire_at"])
         self.assertTrue(595 < (expires - datetime.now(UTC)).total_seconds() <= 600)
         self.assertEqual(body["members"][0]["op"], "add")
 
-    async def test_mute_without_duration_previews_and_executes_ten_minutes(self):
+    async def test_mute_without_duration_immediately_executes_ten_minutes(self):
         panel = await self.manager.handle(self.ctx, "禁言 target", self.api)
         self.assertIn("600 秒", panel.body)
-        self.assertIn("/确认 ", panel.body)
+        self.assertEqual(panel.title, "操作已完成")
+        self.assertNotIn("/确认", panel.body)
         self.assertNotIn("/群管", panel.body)
-        self.assertEqual(self.transport.calls, [])
-        await self.manager.handle(self.ctx, panel.buttons[0].command, self.api)
+        self.assertEqual(len(self.transport.calls), 1)
         body = self.transport.calls[0][2]
         self.assertEqual(body["members"][0]["member_openid"], "target")
         expires = datetime.fromisoformat(body["members"][0]["mute_expire_at"])
@@ -172,21 +226,20 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_numeric_member_openid_remains_a_valid_default_mute_target(self):
         member = "12345678901234567890123456789012"
-        confirmation = await self.prepare(f"禁言 {member}")
-        await self.manager.handle(self.ctx, confirmation, self.api)
+        await self.manager.handle(self.ctx, f"禁言 {member}", self.api)
         self.assertEqual(self.transport.calls[0][2]["members"][0]["member_openid"], member)
 
     async def test_success_http_status_with_invalid_body_is_still_uncertain(self):
-        confirmation = await self.prepare("移出 target")
         self.transport.failure = QQAPIError(200, "INVALID_RESPONSE", "invalid JSON")
-        panel = await self.manager.handle(self.ctx, confirmation, self.api)
+        panel = await self.manager.handle(self.ctx, "移出 target", self.api)
         self.assertEqual(panel.title, "操作结果尚未确认")
         self.assertEqual((await self.store.recent_audit(self.ctx))[0]["status"], "unknown")
 
-    async def test_notice_reply_uses_current_confirmation_event_not_original_message(self):
-        confirmation = await self.prepare("全体通知 活动开始")
+    async def test_notice_reply_uses_current_button_event(self):
         click = replace(self.ctx, message_id="", event_id="INTERACTION_CREATE:new")
-        await self.manager.handle(click, confirmation, self.api)
+        await self.manager.handle(
+            click, "全体通知 活动开始", self.api, request_key="button:notice-button-id"
+        )
         body = self.transport.calls[0][2]
         self.assertNotIn("msg_id", body)
         self.assertEqual(body["event_id"], click.event_id)
@@ -216,7 +269,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("同意 waiting new", commands)
         self.assertIn("入群 next", commands)
 
-    async def test_missing_request_id_and_unknown_json_fields_reject_before_confirmation(self):
+    async def test_missing_request_id_and_unknown_json_fields_reject_before_execution(self):
         for command in [
             "同意 applicant",
             '策略修改 s {"make_admin":true}',

@@ -205,6 +205,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         bot = make_bot()
         session = FakeSession()
         transport = BotpyTransport(bot)
+        self.assertEqual(transport.application_id, "app-1")
         with patch("qq_admin.integration.aiohttp.ClientSession", return_value=session):
             response = await transport.request("GET", "/v2/groups/group-1/info")
         self.assertEqual(response, {"ok": True})

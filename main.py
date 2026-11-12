@@ -18,7 +18,7 @@ from .qq_admin.integration import (
     reply_age_seconds,
     send_payload,
 )
-from .qq_admin.manager import AdminManager
+from .qq_admin.manager import WRITE_COMMANDS, AdminManager, split_head
 from .qq_admin.panels import Panel, build_payload
 from .qq_admin.security import AccessControl
 from .qq_admin.store import LocalStore
@@ -53,7 +53,7 @@ def _plain_panel(panel: Panel) -> str:
     "astrbot_plugin_qqofficial_admin",
     "QQ Official Admin Contributors",
     "QQ 官方群管理、原生按钮与入群审批",
-    "1.1.0",
+    "1.2.0",
 )
 class QQOfficialAdmin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -118,10 +118,10 @@ class QQOfficialAdmin(Star):
             return transport
 
     @filter.command(
-        "面板", alias=(set(DIRECT_COMMANDS) - {"面板", "help"}) | {"群管", "qqadmin"}, priority=100
+        "菜单", alias=(set(DIRECT_COMMANDS) - {"菜单", "help"}) | {"群管", "qqadmin"}, priority=100
     )
     async def admin_command(self, event: AstrMessageEvent):
-        """发送 /禁言 @成员 10m 管理成员，/面板 打开面板，/帮助 查看命令。"""
+        """/设置菜单 安装 QQ 官方指令菜单；/禁言 @成员 直接执行；/菜单 打开快捷入口。"""
         if self._closing or not self.config.get("enabled", True):
             return
         ctx = extract_event_context(event)
@@ -145,11 +145,17 @@ class QQOfficialAdmin(Star):
         event.stop_event()
         interaction = event.get_button_interaction()
         try:
-            command = AccessControl.verify_button(ctx, getattr(interaction, "data", None))
+            data = getattr(interaction, "data", None)
+            command = AccessControl.verify_button(ctx, data)
+            request_key = (
+                AccessControl.button_request_key(data)
+                if split_head(command)[0] in WRITE_COMMANDS
+                else ""
+            )
         except ValueError as exc:
             await self._respond_error(event, str(exc))
             return
-        await self._dispatch(event, command)
+        await self._dispatch(event, command, request_key=request_key)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-100)
     async def observe_group_message(self, event: AstrMessageEvent):
@@ -169,31 +175,35 @@ class QQOfficialAdmin(Star):
         if self._manager:
             self._manager.messages.remember(ctx, timestamp=time.time() - reply_age_seconds(event))
 
-    async def _dispatch(self, event: AstrMessageEvent, command: str):
+    async def _dispatch(self, event: AstrMessageEvent, command: str, *, request_key: str = ""):
         if self._closing:
             return
         task = asyncio.current_task()
         if task:
             self._active_handlers.add(task)
         try:
-            await self._run_dispatch(event, command)
+            await self._run_dispatch(event, command, request_key=request_key)
         finally:
             if task:
                 self._active_handlers.discard(task)
 
-    async def _run_dispatch(self, event: AstrMessageEvent, command: str):
+    async def _run_dispatch(self, event: AstrMessageEvent, command: str, *, request_key: str = ""):
         await self.initialize()
         ctx = extract_event_context(event)
         if self._closing or ctx is None or self._manager is None:
             return
         try:
             self._manager.access.check_group(ctx)
+            if split_head(command)[0] in WRITE_COMMANDS and reply_age_seconds(event) >= 300:
+                raise ValueError("这条操作消息已超过 5 分钟，请发送新指令。")
             if self.config.get("remember_messages", True):
                 self._manager.messages.remember(
                     ctx, timestamp=time.time() - reply_age_seconds(event)
                 )
             transport = await self._transport(event)
-            panel = await self._manager.handle(ctx, command, QQGroupAPI(transport))
+            panel = await self._manager.handle(
+                ctx, command, QQGroupAPI(transport), request_key=request_key
+            )
         except QQAPIError as exc:
             panel = Panel("官方接口暂不可用", exc.user_message())
         except ValueError as exc:
@@ -201,7 +211,8 @@ class QQOfficialAdmin(Star):
         except Exception:
             logger.error("QQ 官方群管处理异常，请检查插件配置与数据目录。")
             panel = Panel(
-                "处理失败", "未能完成本次请求。若已经确认过操作，请先通过日志或状态查询核实结果。"
+                "处理失败",
+                "未能完成本次请求，请先通过日志或状态查询核实结果，再决定是否发送新指令。",
             )
         await self._deliver(event, panel)
 

@@ -1,4 +1,4 @@
-"""中文命令与按钮共用鉴权、预览、确认、执行和审计流程。"""
+"""中文命令与按钮共用鉴权、直接执行、防重复和审计流程。"""
 
 from __future__ import annotations
 
@@ -12,13 +12,23 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .api import QQAPIError, QQGroupAPI
+from .official_menu import OfficialMenu
 from .pagination import ResultPager
-from .panels import ButtonSpec, Panel, escape_markdown, help_panel, home_panel, result_panel
+from .panels import ButtonSpec, Panel, help_panel, home_panel
 from .security import AccessControl
 from .store import LocalStore
 
 logger = logging.getLogger(__name__)
-GLOBAL_COMMANDS = {"策略列表", "策略创建", "策略修改", "策略删除", "策略执行", "策略白名单"}
+GLOBAL_COMMANDS = {
+    "策略列表",
+    "策略创建",
+    "策略修改",
+    "策略删除",
+    "策略执行",
+    "策略白名单",
+    "设置菜单",
+    "移除菜单",
+}
 WRITE_COMMANDS = {
     "移出",
     "拉黑",
@@ -36,8 +46,10 @@ WRITE_COMMANDS = {
     "撤回",
     "通知",
     "全体通知",
+    "设置菜单",
+    "移除菜单",
 }
-HOME = ButtonSpec("返回面板", "面板")
+HOME = ButtonSpec("返回菜单", "菜单")
 DEFAULT_MUTE_SECONDS = 600
 
 
@@ -156,13 +168,14 @@ class AdminManager:
         self.access = AccessControl(config)
         self.messages = RecentMessages()
         self.pager = ResultPager()
+        self.menu = OfficialMenu()
 
-    async def handle(self, ctx: Any, text: str, api: QQGroupAPI) -> Panel:
+    async def handle(self, ctx: Any, text: str, api: QQGroupAPI, *, request_key: str = "") -> Panel:
         self.access.check_group(ctx)
         if len(text) > 16000:
             raise ValueError("命令过长，请拆分操作。")
         command, args = split_head(text)
-        command = command or "面板"
+        command = command or "菜单"
         if command in {"帮助", "help"}:
             return help_panel()
         if command in {"身份", "我的ID"}:
@@ -173,41 +186,30 @@ class AdminManager:
                 f"受信任管理员配置项：\n{ctx.platform_id}|{ctx.group_id}|{ctx.user_id}",
                 [HOME],
             )
-        if command == "面板":
+        if command in {"菜单", "面板"}:
             return home_panel()
-        if command == "取消":
-            await self.store.cancel(ctx, args.strip())
-            return Panel("操作已取消", "本次确认已失效。", [HOME])
-        if command == "确认":
-            return await self._confirm(ctx, args.strip(), api)
+        if command in {"确认", "取消"}:
+            return Panel(
+                "旧指令已停用",
+                "管理指令已改为直接执行。旧确认记录已失效，请发送新的管理指令。",
+                [HOME],
+            )
         await self.access.require(ctx, api, global_operation=command in GLOBAL_COMMANDS)
         if command in WRITE_COMMANDS:
             action, params, summary = self._parse_write(ctx, command, args)
-            if len(summary) > 2200 or len(escape_markdown(summary)) > 2800:
-                raise ValueError("操作详情过长，无法完整展示确认内容，请分批提交。")
-            pending = await self.store.prepare(
-                ctx,
-                action,
-                params,
-                summary,
-                int(self.config.get("confirm_timeout", 120)),
-            )
-            return Panel(
-                "请确认管理操作",
-                summary + "\n\n仅本次操作者可确认，"
-                f"{max(0, int(pending.expires_at - time.time()))} 秒内有效。\n"
-                "确认时会再次验证权限，重复点击不会重复执行。\n\n"
-                f"文本确认：/确认 {pending.token}\n"
-                f"取消：/取消 {pending.token}",
-                [
-                    ButtonSpec("确认执行", f"确认 {pending.token}", danger=True),
-                    ButtonSpec("取消操作", f"取消 {pending.token}"),
-                ],
-            )
+            request_key = request_key or (f"message:{ctx.message_id}" if ctx.message_id else "")
+            audit_id = await self.store.claim_execution(ctx, request_key, action, params)
+            return await self._run_write(ctx, action, params, summary, audit_id, api)
         return await self._read(ctx, command, args, api)
 
     async def _read(self, ctx: Any, command: str, args: str, api: QQGroupAPI) -> Panel:
         group = ctx.group_id
+        if command == "菜单状态":
+            if args.strip():
+                raise ValueError("用法：/菜单状态，仅查询当前群的官方指令面板。")
+            return self.pager.show(
+                ctx, "官方指令菜单状态", await self.menu.status(ctx, api), [HOME]
+            )
         if command == "结果":
             token, index = split_head(args)
             try:
@@ -240,8 +242,8 @@ class AdminManager:
                 ButtonSpec("禁言10分钟", f"禁言 {member} 10m"),
                 ButtonSpec("禁言1小时", f"禁言 {member} 1h"),
                 ButtonSpec("解除禁言", f"解禁 {member}"),
-                ButtonSpec("移出成员", f"移出 {member}"),
-                ButtonSpec("移出并拉黑", f"移出 {member} 拉黑"),
+                ButtonSpec("移出成员", f"移出 {member}", danger=True),
+                ButtonSpec("移出并拉黑", f"移出 {member} 拉黑", danger=True),
                 HOME,
             ]
             return self.pager.show(ctx, "成员详情", data, buttons)
@@ -302,6 +304,10 @@ class AdminManager:
 
     def _parse_write(self, ctx: Any, command: str, args: str) -> tuple[str, dict, str]:
         scope = f"群 OpenID：{ctx.group_id}"
+        if command in {"设置菜单", "移除菜单"}:
+            if args.strip():
+                raise ValueError(f"用法：/{command}，仅管理当前群的官方指令面板。")
+            return command, {}, f"{scope}\n{command}：当前群的 QQ 官方指令面板。"
         if command == "移出":
             add_blacklist = args.endswith(" 拉黑")
             ids = parse_ids(args[:-3].strip() if add_blacklist else args, 20)
@@ -338,10 +344,7 @@ class AdminManager:
             return (
                 command,
                 {"members": ids, "seconds": seconds},
-                (
-                    f"{scope}\n{command} {len(ids)} 名成员，确认执行起 {seconds} 秒：\n"
-                    + "\n".join(ids)
-                ),
+                (f"{scope}\n{command} {len(ids)} 名成员，执行起 {seconds} 秒：\n" + "\n".join(ids)),
             )
         if command in {"同意", "拒绝"}:
             member, rest = split_head(args)
@@ -442,12 +445,11 @@ class AdminManager:
             summary += "\n未指定到期时间，官方默认有效期为一年。"
         return summary
 
-    async def _confirm(self, ctx: Any, token: str, api: QQGroupAPI) -> Panel:
-        pending = await self.store.peek(ctx, token)
-        await self.access.require(ctx, api, global_operation=pending.action in GLOBAL_COMMANDS)
-        pending, audit_id = await self.store.claim(ctx, token)
+    async def _run_write(
+        self, ctx: Any, action: str, params: dict, summary: str, audit_id: int, api: QQGroupAPI
+    ) -> Panel:
         try:
-            result = await self._execute(ctx, pending.action, pending.params, api)
+            result = await self._execute(ctx, action, params, api)
         except asyncio.CancelledError:
             await asyncio.shield(
                 self._finish(audit_id, "unknown", "任务被中断，请查询官方状态确认结果。")
@@ -461,7 +463,7 @@ class AdminManager:
             )
             await self._finish(audit_id, "unknown" if unknown else "failed", exc.user_message())
             title = "操作结果尚未确认" if unknown else "官方接口未执行成功"
-            suffix = "\n该确认已消费，不会自动重试。请先查询实际状态，再决定是否重新发起。"
+            suffix = "\n本次请求不会自动重试。请先查询实际状态，再决定是否发送新指令。"
             return Panel(title, exc.user_message() + suffix, [HOME])
         except ValueError as exc:
             await self._finish(audit_id, "failed", str(exc))
@@ -481,15 +483,42 @@ class AdminManager:
         failures = result.get("fail_openids") or result.get("add_to_member_blacklist_fail_openids")
         status = "partial" if failures else "success"
         await self._finish(audit_id, status, "部分成员操作失败" if failures else "官方接口返回成功")
-        if pending.action == "策略执行":
-            return result_panel(
+        if action == "策略执行":
+            return self._write_result(
+                ctx,
+                action,
                 "策略执行请求已受理",
                 {"说明": "平台异步处理，通常约 10 分钟；尚不表示申请已通过。", **result},
+            )
+        return self._write_result(
+            ctx,
+            action,
+            "部分操作未成功" if failures else "操作已完成",
+            summary
+            + "\n\n"
+            + (
+                json.dumps(result, ensure_ascii=False, indent=2)
+                if result
+                else "官方接口已返回成功。"
+            ),
+        )
+
+    def _write_result(self, ctx: Any, action: str, title: str, data: Any) -> Panel:
+        try:
+            panel = self.pager.show(
+                ctx, title, data, [HOME], global_operation=action in GLOBAL_COMMANDS
+            )
+            if not any(button.command.startswith("结果 ") for button in panel.buttons):
+                panel.title = title
+            return panel
+        except ValueError:
+            # Rendering failure after a completed write must not suggest that
+            # the operation never ran or encourage a blind retry.
+            return Panel(
+                title,
+                "官方接口已返回结果，但内容过大无法完整显示。请通过 /日志 和对应状态查询核实，勿直接重复操作。",
                 [HOME],
             )
-        return result_panel(
-            "部分操作未成功" if failures else "操作已完成", result or "官方接口已返回成功。", [HOME]
-        )
 
     async def _finish(self, audit_id: int, status: str, detail: str) -> None:
         try:
@@ -499,6 +528,10 @@ class AdminManager:
 
     async def _execute(self, ctx: Any, action: str, params: dict, api: QQGroupAPI) -> dict:
         group = ctx.group_id
+        if action == "设置菜单":
+            return await self.menu.install(ctx, api)
+        if action == "移除菜单":
+            return await self.menu.remove(ctx, api)
         if action == "移出":
             return await api.remove_members(
                 group, params["members"], add_to_blacklist=params["add_to_blacklist"]
@@ -544,7 +577,7 @@ class AdminManager:
                 payload["content"] = "<qqbot-at-everyone />\n" + payload["content"]
             reply = ctx.event_id or ctx.message_id
             if not reply:
-                raise ValueError("缺少确认消息或按钮的回复凭据，请重新发起操作。")
+                raise ValueError("缺少消息或按钮的回复凭据，请重新发起操作。")
             payload["event_id" if ctx.event_id else "msg_id"] = reply
             payload["msg_seq"] = await api.transport.next_message_sequence(group, reply)
             result = await api.send_message(group, payload)

@@ -275,6 +275,122 @@ class APIContractTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.api.get_group_info(group)
 
+    async def test_group_native_panel_endpoints_and_response_fields(self):
+        panel = {
+            "items": [
+                {
+                    "type": "command",
+                    "name": "/群管 信息",
+                    "desc": "查看本群信息",
+                    "only_admin": True,
+                },
+                {"type": "link", "name": "帮助", "link": "https://example.com/help"},
+            ],
+            "remark": "qqofficial_admin.command_menu.v1",
+        }
+        self.transport.response = {"records": [], "next_cursor": "opaque+/=", "is_end": False}
+        result = await self.api.list_panels(cursor="current+/=", limit=50)
+        self.assertEqual(result["next_cursor"], "opaque+/=")
+        self.assertEqual(
+            self.transport.calls[-1],
+            ("GET", "/v2/panels", None, {"scope": "group", "cursor": "current+/=", "limit": 50}),
+        )
+        self.transport.response = {"panel_id": "p-owned"}
+        self.assertEqual((await self.api.create_panel(["group-a"], panel))["panel_id"], "p-owned")
+        self.assertEqual(
+            self.transport.calls[-1],
+            (
+                "POST",
+                "/v2/panels",
+                {
+                    "scope": "group",
+                    "target_type": "specific",
+                    "group_openids": ["group-a"],
+                    "panel": panel,
+                },
+                None,
+            ),
+        )
+        self.transport.response = {
+            "panel_id": "p-owned",
+            "scope": "group",
+            "target_type": "specific",
+            "panel": panel,
+            "group_openids": ["group-a"],
+            "version": 2,
+        }
+        self.assertEqual((await self.api.get_panel("p-owned"))["group_openids"], ["group-a"])
+        self.assertEqual(self.transport.calls[-1], ("GET", "/v2/panels/p-owned", None, None))
+        self.transport.response = {"version": 3}
+        self.assertEqual((await self.api.update_panel("p-owned", panel))["version"], 3)
+        self.assertEqual(
+            self.transport.calls[-1], ("PUT", "/v2/panels/p-owned", {"panel": panel}, None)
+        )
+        self.transport.response = None
+        self.assertEqual(await self.api.update_panel_groups("p-owned", "add", ["group-b"]), {})
+        self.assertEqual(
+            self.transport.calls[-1],
+            ("PUT", "/v2/panels/p-owned/target", {"op": "add", "group_openids": ["group-b"]}, None),
+        )
+        self.assertEqual(await self.api.delete_panel("p-owned"), {})
+        self.assertEqual(self.transport.calls[-1], ("DELETE", "/v2/panels/p-owned", None, None))
+
+    async def test_panel_command_uses_name_and_rejects_undocumented_template_fields(self):
+        command = {
+            "type": "command",
+            "name": "/群管 取消拉黑",
+            "desc": "补充成员 OpenID",
+            "only_admin": True,
+        }
+        panel = {"items": [command], "remark": "owner-marker", "version": 1}
+        await self.api.create_panel(["g"], panel)
+        sent = self.transport.calls[-1][2]
+        self.assertEqual(sent["panel"]["items"][0]["name"], "/群管 取消拉黑")
+        command["name"] = "changed"
+        self.assertEqual(sent["panel"]["items"][0]["name"], "/群管 取消拉黑")
+        for item in (
+            {"type": "command", "name": "/群管 信息", "data": "separate command"},
+            {"type": "command", "name": "/群管 信息", "enter": True},
+            {"type": "command", "name": "/群管 信息", "params": ["member"]},
+            {"type": "command", "name": "/群管 策略白名单"},
+            {"type": "command", "name": "查询", "desc": "字" * 16},
+            {"type": "command", "name": "查询", "only_admin": "true"},
+            {"type": "command", "name": "查询", "link": "https://example.com"},
+            {"type": "link", "name": "帮助", "link": "http://example.com"},
+            {"type": "link", "name": "帮助", "link": "https://"},
+            {"type": "link", "name": "帮助"},
+            {"type": "callback", "name": "操作"},
+        ):
+            with self.subTest(item=item), self.assertRaises(ValueError):
+                await self.api.update_panel("p", {"items": [item]})
+        self.assertEqual(len(self.transport.calls), 1)
+
+    async def test_panel_limits_targets_and_ids_are_checked_before_sending(self):
+        panel = {"items": [{"type": "command", "name": "/群管 信息"}]}
+        await self.api.create_panel([f"g{i}" for i in range(20)], {"items": panel["items"] * 20})
+        await self.api.update_panel_groups("p/../?#", "del", ["g"])
+        self.assertEqual(self.transport.calls[-1][1], "/v2/panels/p%2F..%2F%3F%23/target")
+        for call in (
+            lambda: self.api.list_panels(limit=51),
+            lambda: self.api.list_panels(limit=True),
+            lambda: self.api.create_panel([], panel),
+            lambda: self.api.create_panel(["g", "g"], panel),
+            lambda: self.api.create_panel("g", panel),
+            lambda: self.api.create_panel([f"g{i}" for i in range(21)], panel),
+            lambda: self.api.create_panel(["g"], {"items": []}),
+            lambda: self.api.create_panel(["g"], {"items": panel["items"] * 21}),
+            lambda: self.api.create_panel(["g"], {**panel, "remark": "x" * 256}),
+            lambda: self.api.create_panel(["g"], {**panel, "version": True}),
+            lambda: self.api.create_panel(["g"], {**panel, "target_type": "all"}),
+            lambda: self.api.update_panel_groups("p", "remove", ["g"]),
+            lambda: self.api.update_panel_groups("p", "add", [f"g{i}" for i in range(21)]),
+            lambda: self.api.get_panel(".."),
+            lambda: self.api.delete_panel("bad\nheader"),
+        ):
+            with self.assertRaises(ValueError):
+                await call()
+        self.assertEqual(len(self.transport.calls), 2)
+
     async def test_markdown_buttons_and_at_everyone_preserve_official_payload(self):
         payload = {
             "msg_type": 2,
