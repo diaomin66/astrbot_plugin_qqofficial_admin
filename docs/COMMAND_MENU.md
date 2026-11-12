@@ -98,21 +98,25 @@ v1.2.1 中，`INVALID_RESPONSE` 表示插件无法解析响应，或关键字段
 - 已发出修改请求，但响应无法确认结果：提示「操作结果尚未确认」，审计记为 `unknown`，不会自动重发写请求。
 - 菜单创建响应缺少有效 `panel_id`、更新响应缺少有效 `version`，或这两个接口的成功响应无法解析：插件尝试一次只读核实。创建操作重新遍历列表并读取详情，更新操作直接读取已知面板详情；仅在面板唯一性（创建时）、归属标记、当前群关联和完整命令内容全部符合预期后报告完成。核实失败仍保留原写请求的异常诊断。超时和服务端错误不触发这项恢复。
 
-列表仍要求 `records` 为数组。分页可使用 `is_end=true` 或显式 `next_cursor=""` 任一结束信号；两者同时存在时必须一致，缺少结束及进展信息、字段类型错误、游标循环都会停止安装。不会把空对象或 `records=null` 当作“没有菜单”。这是根据文档字段语义做的兼容处理，官方示例仍同时返回两项分页字段。
+列表通常要求 `records` 为数组。分页可使用 `is_end=true` 或显式 `next_cursor=""` 任一结束信号；两者同时存在时必须一致，缺少结束及进展信息、字段类型错误、游标循环都会停止安装。
 
-错误回复和 AstrBot 日志包含固定的指令名、脱敏的接口路径模板、实际 HTTP 状态（有响应时）、安全格式的 TraceID，以及失败字段、预期/实际类型。例如：
+v1.2.2 增加有条件的空页兼容：`records` 缺失或为 `null`，同时满足明确且不矛盾的末页标记，并且响应只包含 `records`、`is_end`、`next_cursor` 及已知状态元数据（`code`、`err_code`、`trace_id`、`message`、`err_msg`）时，按空终止页处理。存在错误码时必须是零或 `null`；其余状态元数据必须是字符串或 `null`。这属于对省略空集合的兼容假设，官方示例没有描述此变体；不能仅凭 `actual=missing` 断定真实响应就是空页。`{}`、只有零错误码、存在 `data` 包装或其他未知业务字段、缺少记录但仍有下一页时，都会停止修改。已在之前分页发现的面板不会因空终止页而丢失。
+
+错误回复和 AstrBot 日志包含固定的指令名、脱敏的接口路径模板、实际 HTTP 状态（有响应时）、安全格式的 TraceID，以及失败字段、预期/实际类型。v1.2.2 将错误回复作为纯文本发送，避免 QQ Markdown 转义干扰下划线；普通菜单继续使用 Markdown 和按钮。菜单校验错误还包含安全的 `response_shape`。例如：
 
 ```text
 未执行操作
 指令：/设置菜单
 QQ 接口返回的响应无法通过校验。
-诊断：GET /v2/panels HTTP=200 错误码 INVALID_RESPONSE TraceID example_trace reason=field_type field=records expected=list actual=null request_sent=true
+诊断：GET /v2/panels HTTP=200 错误码 INVALID_RESPONSE TraceID example_trace reason=field_type field=records expected=list actual=missing request_sent=true response_shape=object{data:object,code:number,data.records:array,data.is_end:boolean(true)}
 未发送修改请求。本次请求不会自动重试，请根据诊断检查后重新发起。
 ```
 
 `request_sent=true` 表示该诊断对应的 HTTP 请求已尝试发送；上例是 GET 查询，不表示已修改菜单。诊断不输出真实群/成员/面板 ID、游标、令牌、消息正文或原始响应。TraceID 优先取响应头，也支持官方调用指南中的响应体 `trace_id`。
 
-遇到旧版泛化的 `INVALID_RESPONSE` 提示，先升级并重载插件。如失败指令是 `/设置菜单`，先发送 `/菜单状态` 查看当前菜单，避免已成功创建后盲目重建。再次出现异常时，反馈触发指令和完整的新版诊断行即可，无需提供 AppSecret、access_token 或原始响应。由于没有真实账号响应，仅能据诊断继续定位，不能将所有 `INVALID_RESPONSE` 都归因于某一种字段差异。
+`response_shape` 最多 700 字符，仅展示固定字段名和类型；`data` 最多查看一层，未知字段只计数，列表内的面板内容不展开。它会区分 `{}`（显示 `object{}`）、只有末页标记的对象、嵌套的 `data.records` 等结构。除 `is_end` 的布尔值、游标为空或非空外，不输出字段原值，不将结构摘要当作接口成功或权限有效的依据。
+
+遇到旧版泛化的 `INVALID_RESPONSE` 提示，先升级并重载插件。如提示“未发送修改请求”，本次没有创建或更新菜单；可在更新后重新发送 `/设置菜单`。如提示“操作结果尚未确认”，先发送 `/菜单状态` 核实。再次出现异常时，反馈含 `response_shape` 的完整诊断行即可，无需提供 AppSecret、access_token 或原始响应。仅有 `records=missing` 的诊断不足以确定实际响应结构，不能将所有 `INVALID_RESPONSE` 都归因于某一种字段差异。
 
 ## 官方核验来源
 

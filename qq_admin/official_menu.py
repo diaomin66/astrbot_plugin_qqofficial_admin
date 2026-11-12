@@ -12,6 +12,9 @@ from .menu import group_command_items
 _MISSING = object()
 _PANELS_ROUTE = "/v2/panels"
 _PANEL_ROUTE = "/v2/panels/{panel_id}"
+_EMPTY_PAGE_FIELDS = frozenset(
+    {"records", "is_end", "next_cursor", "code", "err_code", "trace_id", "message", "err_msg"}
+)
 
 
 def _value_type(value: Any) -> str:
@@ -68,6 +71,33 @@ class OfficialMenu:
             expected=expected,
             actual=actual,
             request_sent=True,
+            response=response,
+        )
+
+    @staticmethod
+    def _omitted_empty_records(data: dict) -> bool:
+        """Accept a terminal empty collection only in an otherwise known shape.
+
+        Some serializers omit an empty collection or use null. A missing field
+        alone cannot establish an empty page: require an explicit, consistent
+        end marker, and reject envelopes or alternate collection fields.
+        """
+        if data.get("records", _MISSING) not in (_MISSING, None):
+            return False
+        if data.keys() - _EMPTY_PAGE_FIELDS:
+            return False
+        for key in ("trace_id", "message", "err_msg"):
+            value = data.get(key)
+            if value is not None and not isinstance(value, str):
+                return False
+        for key in ("code", "err_code"):
+            value = data.get(key)
+            if value is not None and (type(value) not in (int, str) or value not in (0, "0")):
+                return False
+        is_end = data.get("is_end", _MISSING)
+        cursor = data.get("next_cursor", _MISSING)
+        return (is_end is True and (cursor is _MISSING or cursor == "")) or (
+            cursor == "" and is_end is _MISSING
         )
 
     def _validate_detail(self, ctx: Any, detail: dict, panel_id: str) -> None:
@@ -143,6 +173,8 @@ class OfficialMenu:
         for _ in range(21):
             data = await api.list_panels(cursor=cursor)
             records = data.get("records", _MISSING)
+            if self._omitted_empty_records(data):
+                records = []
             if not isinstance(records, list):
                 raise self._invalid(
                     data,

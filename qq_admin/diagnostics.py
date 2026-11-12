@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -105,6 +106,84 @@ DIAGNOSTIC_VALUES = frozenset(
         "page_limit",
     }
 )
+RESPONSE_SHAPE_FIELDS = (
+    "records",
+    "is_end",
+    "next_cursor",
+    "data",
+    "list",
+    "panels",
+    "items",
+    "code",
+    "err_code",
+    "retcode",
+    "ret",
+    "status",
+    "message",
+    "trace_id",
+    "total",
+    "count",
+    "panel_id",
+    "version",
+    "scope",
+    "target_type",
+    "panel",
+    "group_openids",
+)
+MAX_RESPONSE_SHAPE_LENGTH = 700
+
+
+def response_shape_parts(response: Mapping[str, Any] | None) -> tuple[str, ...] | None:
+    """Snapshot only fixed field/type labels, never retain response values.
+
+    The two intentional value distinctions are pagination's boolean is_end
+    and whether a string cursor is empty. Only the root data object is entered.
+    """
+    if not isinstance(response, Mapping):
+        return None
+    parts: list[str] = []
+
+    def append_fields(value: Mapping[str, Any], prefix: str = "") -> None:
+        known = 0
+        for key in RESPONSE_SHAPE_FIELDS:
+            if key not in value:
+                continue
+            known += 1
+            item = value[key]
+            kind = "object" if isinstance(item, Mapping) else json_type(item) or "unknown"
+            if key == "is_end" and isinstance(item, bool):
+                kind = f"boolean({'true' if item else 'false'})"
+            elif key == "next_cursor" and isinstance(item, str):
+                kind = f"string({'nonempty' if item else 'empty'})"
+            elif key == "data" and isinstance(item, Mapping) and not item:
+                kind = "object{}"
+            parts.append(f"{prefix}{key}:{kind}")
+        unknown = max(0, len(value) - known)
+        if unknown:
+            parts.append(f"{prefix}unknown_keys:{unknown}")
+
+    append_fields(response)
+    data = response.get("data")
+    if isinstance(data, Mapping):
+        append_fields(data, "data.")
+    return tuple(parts)
+
+
+def format_response_shape(parts: tuple[str, ...] | None) -> str:
+    """Render normalized parts, truncating only between complete fields."""
+    if parts is None:
+        return ""
+    included: list[str] = []
+    size = len("object{}")
+    for index, part in enumerate(parts):
+        extra = len(part) + bool(included)
+        reserve = len(",...") if index + 1 < len(parts) else 0
+        if size + extra + reserve > MAX_RESPONSE_SHAPE_LENGTH:
+            included.append("...")
+            break
+        included.append(part)
+        size += extra
+    return "object{" + ",".join(included) + "}"
 
 
 def allowed(value: Any, options: frozenset[str], *, default: str = "") -> str:

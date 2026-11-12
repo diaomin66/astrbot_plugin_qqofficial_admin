@@ -44,6 +44,9 @@ class Panel:
     title: str
     body: str
     buttons: list[ButtonSpec] = field(default_factory=list)
+    # Diagnostic identifiers must remain copyable even in QQ clients that
+    # display Markdown escape characters instead of interpreting them.
+    prefer_plain_text: bool = False
 
 
 def escape_markdown(value: Any) -> str:

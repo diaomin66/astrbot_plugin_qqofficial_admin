@@ -509,7 +509,7 @@ class AdminManager:
                 status,
                 exc.user_message(),
             )
-            return Panel(title, f"指令：/{action}\n" + detail, [HOME])
+            return Panel(title, f"指令：/{action}\n" + detail, [HOME], prefer_plain_text=True)
         except ValueError as exc:
             if state.mutation_started:
                 await self._finish(audit_id, "unknown", "修改请求已发起，但后续校验未完成。")

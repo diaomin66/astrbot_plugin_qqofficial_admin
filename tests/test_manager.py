@@ -279,9 +279,10 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                         await self.manager.handle(ctx, command, self.api)
 
     async def test_menu_invalid_list_explains_field_without_creating_a_panel(self):
-        self.transport.result = {"records": None, "is_end": True, "next_cursor": ""}
+        self.transport.result = {"records": None, "is_end": False, "next_cursor": "more"}
         panel = await self.manager.handle(self.ctx, "设置菜单", self.api)
         self.assertEqual(panel.title, "未执行操作")
+        self.assertTrue(panel.prefer_plain_text)
         self.assertIn("/设置菜单", panel.body)
         self.assertIn("GET /v2/panels", panel.body)
         self.assertIn("records", panel.body)
@@ -328,7 +329,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                 await finish_write.wait()
                 raise QQAPIError(0, "TIMEOUT", "write timeout")
             await write_started.wait()
-            return {"records": None, "is_end": True}
+            return {"records": None, "is_end": False}
 
         self.transport.request = AsyncMock(side_effect=request)
         write_ctx = replace(self.ctx, message_id="concurrent-write")

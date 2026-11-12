@@ -338,6 +338,103 @@ class OfficialMenuTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["状态"], "已创建")
                 self.assertEqual([call[0] for call in api.calls], ["list", "create"])
 
+    async def test_omitted_or_null_records_with_unambiguous_end_can_create_first_menu(self):
+        for records in ({}, {"records": None}):
+            for pagination in (
+                {"is_end": True},
+                {"next_cursor": ""},
+                {"is_end": True, "next_cursor": ""},
+            ):
+                api = StatefulPanelAPI()
+                response = {**records, **pagination, "code": 0, "trace_id": "page-trace"}
+                api.pages = {"": response}
+                with self.subTest(response=response):
+                    result = await self.menu.install(self.ctx, api)
+                    self.assertEqual(result["状态"], "已创建")
+                    self.assertEqual([call[0] for call in api.calls], ["list", "create"])
+                    self.assertEqual(api.panels[result["panel_id"]]["group_openids"], ["group-a"])
+                    # Once created, the upstream list contains its actual row.
+                    api.pages = None
+                    repeated = await self.menu.install(self.ctx, api)
+                    self.assertEqual(repeated["状态"], "已是最新")
+                    self.assertEqual([call[0] for call in api.mutations()], ["create"])
+
+    async def test_terminal_page_without_records_preserves_owned_panel_from_previous_page(self):
+        owned = self.seed_owned()
+        self.api.pages = {
+            "": {"records": [self.api.record(owned)], "next_cursor": "last", "is_end": False},
+            "last": {"is_end": True},
+        }
+        result = await self.menu.install(self.ctx, self.api)
+        self.assertEqual(result["状态"], "已是最新")
+        self.assertEqual(result["panel_id"], "owned")
+        self.assertEqual(self.api.mutations(), [])
+
+    async def test_missing_records_is_not_empty_when_pagination_or_shape_is_ambiguous(self):
+        for response in (
+            {},
+            {"code": 0},
+            {"trace_id": "page-trace"},
+            {"records": None},
+            {"is_end": False},
+            {"is_end": False, "next_cursor": ""},
+            {"is_end": True, "next_cursor": "more"},
+            {"next_cursor": "more"},
+            {"is_end": None, "next_cursor": ""},
+            {"is_end": 1, "next_cursor": ""},
+            {"is_end": True, "next_cursor": None},
+            {"is_end": True, "data": {"records": []}},
+            {"is_end": True, "panels": []},
+            {"is_end": True, "private-unknown-field": "private-value"},
+            {"is_end": True, "code": 11253},
+            {"is_end": True, "err_code": 11253},
+            {"is_end": True, "code": False},
+        ):
+            self.api.pages = {"": response}
+            with self.subTest(response=response), self.assertRaises(QQAPIError) as caught:
+                await self.menu.install(self.ctx, self.api)
+            self.assertIn("response_shape=object{", caught.exception.diagnostic_text())
+            self.assertNotIn("private", caught.exception.diagnostic_text())
+            self.assertEqual(self.api.mutations(), [])
+
+    async def test_missing_records_diagnostic_describes_wrapper_without_exposing_contents(self):
+        self.api.pages = {
+            "": QQResponse(
+                {
+                    "code": 0,
+                    "data": {
+                        "records": [{"panel_id": "private-panel-id"}],
+                        "is_end": True,
+                        "next_cursor": "",
+                    },
+                    "private-secret-key": "private-secret-value",
+                },
+                status=200,
+                trace_id="page-trace",
+                method="GET",
+                route="/v2/panels",
+            )
+        }
+        with self.assertRaises(QQAPIError) as caught:
+            await self.menu.install(self.ctx, self.api)
+        error = caught.exception
+        self.assertEqual((error.field, error.actual), ("records", "missing"))
+        self.assertEqual(error.trace_id, "page-trace")
+        self.assertIn("data.records:array", error.response_shape)
+        self.assertIn("data.is_end:boolean(true)", error.response_shape)
+        self.assertIn("unknown_keys:1", error.response_shape)
+        self.assertNotIn("private", str(error))
+        self.assertEqual(self.api.mutations(), [])
+
+    async def test_missing_records_never_treats_structured_metadata_as_an_empty_page(self):
+        for key in ("trace_id", "message", "err_msg"):
+            for value in ({"records": [{"panel_id": "private-panel"}]}, [], True, 7):
+                self.api.pages = {"": {"is_end": True, key: value}}
+                with self.subTest(key=key, value=value), self.assertRaises(QQAPIError) as caught:
+                    await self.menu.install(self.ctx, self.api)
+                self.assertNotIn("private", str(caught.exception))
+                self.assertEqual(self.api.mutations(), [])
+
     async def test_mixed_pagination_fields_continue_and_find_later_owned_panel(self):
         owned = self.seed_owned()
         for final in ({"is_end": True}, {"next_cursor": ""}):
@@ -378,7 +475,8 @@ class OfficialMenuTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_list_shape_or_owned_record_without_id_does_not_create(self):
         for response in (
-            {"records": None, "is_end": True, "next_cursor": ""},
+            {"records": None, "is_end": False, "next_cursor": "more"},
+            {"records": {}, "is_end": True, "next_cursor": ""},
             {"records": ["invalid"], "is_end": True, "next_cursor": ""},
             {"records": [{"panel_id": "incomplete"}], "is_end": True, "next_cursor": ""},
             {

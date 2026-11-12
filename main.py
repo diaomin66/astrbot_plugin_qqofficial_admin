@@ -53,7 +53,7 @@ def _plain_panel(panel: Panel) -> str:
     "astrbot_plugin_qqofficial_admin",
     "QQ Official Admin Contributors",
     "QQ 官方群管理、原生按钮与入群审批",
-    "1.2.1",
+    "1.2.2",
 )
 class QQOfficialAdmin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -208,7 +208,11 @@ class QQOfficialAdmin(Star):
             head = split_head(command)[0]
             operation = f"/{head}" if head in DIRECT_COMMANDS else "管理查询"
             logger.warning(f"QQ 官方群管 {operation} 请求失败：{exc.user_message()}")
-            panel = Panel("官方接口暂不可用", f"指令：{operation}\n{exc.user_message()}")
+            panel = Panel(
+                "官方接口暂不可用",
+                f"指令：{operation}\n{exc.user_message()}",
+                prefer_plain_text=True,
+            )
         except ValueError as exc:
             panel = Panel("未执行操作", str(exc))
         except Exception:
@@ -237,7 +241,7 @@ class QQOfficialAdmin(Star):
         ctx = extract_event_context(event)
         if ctx is None:
             return None
-        if self.config.get("use_markdown", True):
+        if self.config.get("use_markdown", True) and not panel.prefer_plain_text:
             encoder = partial(encode_callback, expires_at=time.time() + 300)
             payload = build_payload(panel, ctx, encoder)
         else:

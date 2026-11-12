@@ -560,6 +560,154 @@ class APIContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_response_shape_distinguishes_empty_envelope_and_pagination_structures(self):
+        cases = (
+            ({}, "object{}"),
+            ({"data": {}}, "object{data:object{}}"),
+            (
+                {"code": 0, "message": "private success description"},
+                "object{code:number,message:string}",
+            ),
+            (
+                {"is_end": True, "next_cursor": ""},
+                "object{is_end:boolean(true),next_cursor:string(empty)}",
+            ),
+            (
+                {"is_end": False, "next_cursor": "private-cursor"},
+                "object{is_end:boolean(false),next_cursor:string(nonempty)}",
+            ),
+            (
+                {"data": {"records": [], "is_end": True, "next_cursor": ""}, "code": 0},
+                "object{data:object,code:number,data.records:array,"
+                "data.is_end:boolean(true),data.next_cursor:string(empty)}",
+            ),
+            ({"records": None}, "object{records:null}"),
+            ({"records": []}, "object{records:array}"),
+        )
+        for response, expected in cases:
+            with self.subTest(response=response):
+                error = QQAPIError(200, "INVALID_RESPONSE", "ignored", response=response)
+                self.assertEqual(error.response_shape, expected)
+                self.assertIn("response_shape=" + expected, error.diagnostic_text())
+                self.assertEqual(str(error), error.user_message())
+
+    def test_response_shape_never_exposes_unknown_keys_values_or_nested_payloads(self):
+        response = {
+            "records": [{"private-array-key": "private-token"}],
+            "code": "private-code",
+            "message": "private notice content",
+            "trace_id": "private-trace",
+            "is_end": "private-invalid-boolean",
+            "next_cursor": "private-cursor",
+            "panel": {"items": "private-inner-value", "private-panel-key": "private-token"},
+            "private-root-key": "private-token",
+            "records.private-path": "private-value",
+            "data": {
+                "records": ["private-nested-list"],
+                "is_end": 1,
+                "next_cursor": ["private-invalid-cursor"],
+                "data": {"message": "private-deep-message", "private-deep-key": "private-value"},
+                "private-nested-key": "private-value",
+            },
+        }
+        error = QQAPIError(200, "INVALID_RESPONSE", "ignored", response=response)
+        summary = error.response_shape
+        self.assertIn("unknown_keys:2", summary)
+        self.assertIn("data.unknown_keys:1", summary)
+        self.assertIn("is_end:string", summary)
+        self.assertIn("data.is_end:number", summary)
+        self.assertIn("data.next_cursor:array", summary)
+        self.assertIn("data.data:object", summary)
+        self.assertNotIn("data.data.message", summary)
+        self.assertNotIn("panel.items", summary)
+        self.assertNotIn("private", summary)
+        self.assertNotIn("private", error.user_message())
+        self.assertNotIn("private", repr(error))
+
+    def test_response_shape_is_a_snapshot_preserved_by_request_context_enrichment(self):
+        response = {"data": {"records": [], "next_cursor": "private-cursor"}, "is_end": True}
+        error = QQAPIError(200, "INVALID_RESPONSE", "ignored", response=response)
+        original = error.response_shape
+        response["is_end"] = False
+        response["data"].clear()
+        response["private-new-key"] = "private-new-value"
+        rebuilt = error.with_request_context(method="GET", route="/v2/panels", request_sent=True)
+        self.assertEqual(error.response_shape, original)
+        self.assertEqual(rebuilt.response_shape, original)
+        self.assertEqual(str(rebuilt), rebuilt.user_message())
+        self.assertIn("GET /v2/panels", str(rebuilt))
+        self.assertNotIn("private", repr(rebuilt))
+        self.assertNotIn("private", repr(rebuilt.__dict__))
+        with self.assertRaises(AttributeError):
+            rebuilt.response_shape = "private-forged-summary"
+
+    def test_response_shape_does_not_accept_preformatted_strings_or_arbitrary_types(self):
+        for response in (None, "private-forged-summary", ["private-token"], 123):
+            with self.subTest(response=response):
+                error = QQAPIError(200, "INVALID_RESPONSE", "ignored", response=response)
+                self.assertEqual(error.response_shape, "")
+                self.assertNotIn("response_shape=", error.diagnostic_text())
+                self.assertNotIn("private", repr(error))
+        with self.assertRaises(TypeError):
+            QQAPIError(200, "INVALID_RESPONSE", "ignored", response_shape="private-forged-summary")
+        error = QQAPIError(
+            200,
+            "INVALID_RESPONSE",
+            "ignored",
+            response={"code": object(), "data": object(), "next_cursor": b"private-token"},
+        )
+        self.assertEqual(
+            error.response_shape, "object{next_cursor:unknown,data:unknown,code:unknown}"
+        )
+
+    def test_response_shape_covers_only_fixed_fields_and_stops_at_field_boundaries(self):
+        fields = (
+            "records",
+            "is_end",
+            "next_cursor",
+            "data",
+            "list",
+            "panels",
+            "items",
+            "code",
+            "err_code",
+            "retcode",
+            "ret",
+            "status",
+            "message",
+            "trace_id",
+            "total",
+            "count",
+            "panel_id",
+            "version",
+            "scope",
+            "target_type",
+            "panel",
+            "group_openids",
+        )
+        for field in fields:
+            with self.subTest(field=field):
+                error = QQAPIError(200, "INVALID_RESPONSE", "ignored", response={field: None})
+                self.assertEqual(error.response_shape, f"object{{{field}:null}}")
+        nested = dict.fromkeys(fields, "private-token")
+        response = {**nested, "data": nested, "private-root-key": "private-value"}
+        summary = QQAPIError(200, "INVALID_RESPONSE", "ignored", response=response).response_shape
+        self.assertLessEqual(len(summary), 700)
+        self.assertTrue(summary.endswith(",...}"))
+        self.assertNotIn("private", summary)
+        # Every retained entry is complete; truncation never cuts a field name
+        # or type in half and cannot reveal any part of the underlying value.
+        entries = summary.removeprefix("object{").removesuffix("}").split(",")
+        for entry in entries:
+            if entry == "...":
+                continue
+            key, kind = entry.split(":", 1)
+            if key == "unknown_keys":
+                self.assertEqual(kind, "1")
+            else:
+                self.assertIn(key.removeprefix("data."), fields)
+                self.assertIn(kind, {"string", "object", "string(nonempty)"})
+
     def test_error_code_field_type_diagnostics_survive_request_context_enrichment(self):
         for field in ("err_code", "code"):
             with self.subTest(field=field):

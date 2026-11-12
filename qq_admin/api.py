@@ -23,7 +23,9 @@ from .diagnostics import (
     HTTP_METHODS,
     allowed,
     current_request_state,
+    format_response_shape,
     json_type,
+    response_shape_parts,
     route_template,
     safe_route,
     safe_status,
@@ -67,6 +69,7 @@ class QQAPIError(RuntimeError):
         expected: str = "",
         actual: str = "",
         request_sent: bool | None = None,
+        response: Mapping[str, Any] | None = None,
     ) -> None:
         self.status = safe_status(status)
         self.code = code
@@ -79,15 +82,20 @@ class QQAPIError(RuntimeError):
         self.expected = allowed(expected, DIAGNOSTIC_VALUES)
         self.actual = allowed(actual, DIAGNOSTIC_VALUES)
         self.request_sent = request_sent if type(request_sent) is bool else None
+        self._response_shape_parts = response_shape_parts(response)
         # Raw API messages can echo request data; do not put them in exceptions
         # that third-party loggers may print without redaction.
         super().__init__(self.user_message())
+
+    @property
+    def response_shape(self) -> str:
+        return format_response_shape(self._response_shape_parts)
 
     def with_request_context(
         self, *, method: str, route: str, request_sent: bool | None
     ) -> QQAPIError:
         """Rebuild the exception so its args and display diagnostics stay equal."""
-        return QQAPIError(
+        error = QQAPIError(
             self.status,
             self.code,
             self.message,
@@ -100,6 +108,11 @@ class QQAPIError(RuntimeError):
             actual=self.actual,
             request_sent=request_sent,
         )
+        # Copy only the immutable, normalized field/type snapshot. The original
+        # response is neither retained nor reconstructed to enrich an error.
+        error._response_shape_parts = self._response_shape_parts
+        error.args = (error.user_message(),)
+        return error
 
     def diagnostic_text(self) -> str:
         details = []
@@ -120,6 +133,8 @@ class QQAPIError(RuntimeError):
                 details.append(f"{label}={value}")
         if self.request_sent is not None:
             details.append(f"request_sent={'true' if self.request_sent else 'false'}")
+        if self.response_shape:
+            details.append(f"response_shape={self.response_shape}")
         return " ".join(details)
 
     def user_message(self) -> str:

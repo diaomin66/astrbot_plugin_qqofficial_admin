@@ -34,7 +34,10 @@ class PanelTests(unittest.TestCase):
         ]
 
     def test_callback_is_bound_to_panel_owner_group_and_platform(self):
-        payload = build_payload(home_panel(), self.ctx, self.encode)
+        panel = home_panel()
+        self.assertFalse(panel.prefer_plain_text)
+        payload = build_payload(panel, self.ctx, self.encode)
+        self.assertEqual(payload["msg_type"], 2)
         buttons = self.buttons(payload)
         self.assertEqual(len({button["id"] for button in buttons}), len(buttons))
         for button in buttons:
